@@ -51,6 +51,14 @@ const focusOrOpenWindow = function (url) {
   return true
 }
 
+const openNewWindow = function (argv) {
+  if (!appInitialized) {
+    return false
+  }
+  appActions.newWindow()
+  return true
+}
+
 // Checks an array of arguments if it can find a url
 const getUrlFromCommandLine = (argv) => {
   if (argv) {
@@ -80,19 +88,28 @@ const getUrlFromCommandLine = (argv) => {
 }
 
 app.on('ready', () => {
-  if (process.env.NODE_ENV !== 'development' && process.env.NODE_ENV !== 'test') {
+  console.log("READY")
+  //if (process.env.NODE_ENV !== 'development' && process.env.NODE_ENV !== 'test') {
     const appAlreadyStartedShouldQuit = app.makeSingleInstance((argv, workingDirectory) => {
-      // Someone tried to run a second instance, we should focus our window.
-      if (isDarwin) {
-        focusOrOpenWindow()
-      } else {
-        focusOrOpenWindow(getUrlFromCommandLine(argv))
+      console.log("Making single instance")
+      //If trying to open a new window
+      argv.forEach(function(x){console.log(x)})
+      if(argv.indexOf("--new-window")!=-1){
+        openNewWindow()
+      }else{
+        // Someone tried to run a second instance, we should focus our window.
+        if (isDarwin) {
+          focusOrOpenWindow()
+        } else {
+          focusOrOpenWindow(getUrlFromCommandLine(argv))
+        }
       }
     })
     if (appAlreadyStartedShouldQuit) {
+      console.log("exiting")
       app.exit(0)
     }
-  }
+  //}
 })
 
 app.on('will-finish-launching', () => {
