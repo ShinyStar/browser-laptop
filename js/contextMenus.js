@@ -26,7 +26,6 @@ const {getSetting} = require('./settings')
 const settings = require('./constants/settings')
 const textUtils = require('./lib/text')
 const {isIntermediateAboutPage, isUrl, aboutUrls} = require('./lib/appUrlUtil')
-const {getBase64FromImageUrl} = require('./lib/imageUtil')
 const urlParse = require('../app/common/urlParse')
 const {getCurrentWindow} = require('../app/renderer/currentWindow')
 const extensionState = require('../app/common/state/extensionState')
@@ -39,9 +38,30 @@ const platformUtil = require('../app/common/lib/platformUtil')
 const bookmarkFoldersUtil = require('../app/common/lib/bookmarkFoldersUtil')
 const historyUtil = require('../app/common/lib/historyUtil')
 const {makeImmutable} = require('../app/common/state/immutableUtil')
+const ledgerUtil = require('../app/common/lib/ledgerUtil')
 
 const isDarwin = platformUtil.isDarwin()
-const isLinux = platformUtil.isLinux()
+
+const sanitizeUrl = urlUtil.sanitizeForContextMenu
+
+/**
+ * Gets the correct search URL for the current frame.
+ * @param {Immutable.Map} activeFrame - currently active frame
+ * @param {string} searchTerms - terms to search
+ * @returns {string}
+ */
+const getSearchUrl = (activeFrame, searchTerms) => {
+  const searchUrl = (
+    getSetting(settings.SHOW_ALTERNATIVE_PRIVATE_SEARCH_ENGINE) &&
+    (
+      (getSetting(settings.USE_ALTERNATIVE_PRIVATE_SEARCH_ENGINE_TOR) && frameStateUtil.isTor(activeFrame)) ||
+      (getSetting(settings.USE_ALTERNATIVE_PRIVATE_SEARCH_ENGINE) && activeFrame.get('isPrivate'))
+    )
+  )
+  ? 'https://duckduckgo.com/?q={searchTerms}'
+  : appStoreRenderer.state.getIn(['searchDetail', 'searchURL'])
+  return searchUrl.replace('{searchTerms}', encodeURIComponent(searchTerms))
+}
 
 /**
  * Obtains an add bookmark menu item
@@ -91,7 +111,7 @@ const addFolderMenuItem = (closestDestinationDetail, isParent) => {
   }
 }
 
-function urlBarTemplateInit (searchDetail, activeFrame, e) {
+function urlBarTemplateInit (activeFrame, e) {
   const items = getEditableItems(window.getSelection().toString())
   const clipboardText = clipboard.readText()
   const hasClipboard = clipboardText && clipboardText.length > 0
@@ -106,7 +126,7 @@ function urlBarTemplateInit (searchDetail, activeFrame, e) {
       }
     })
   } else {
-    let searchUrl = searchDetail.get('searchURL').replace('{searchTerms}', encodeURIComponent(clipboardText))
+    const searchUrl = getSearchUrl(activeFrame, clipboardText)
 
     items.push({
       label: locale.translation('pasteAndSearch'),
@@ -263,8 +283,9 @@ const siteMultipleDetailTemplate = (data, type, activeFrame) => {
   })
 
   template.push(
-    openInNewTabMenuItem(locations, undefined, partitionNumbers),
+    openInNewTabMenuItem(locations, partitionNumbers),
     openInNewPrivateTabMenuItem(locations),
+    openInNewPrivateTabMenuItem(locations, undefined, true),
     openInNewSessionTabMenuItem(locations),
     CommonMenu.separatorMenuItem
   )
@@ -297,6 +318,7 @@ const siteMultipleDetailTemplate = (data, type, activeFrame) => {
 const siteSingleDetailTemplate = (siteKey, type, activeFrame) => {
   const template = []
   const state = appStoreRenderer.state
+  const paymentsEnabled = getSetting(settings.PAYMENTS_ENABLED)
   let isFolder = type === siteTags.BOOKMARK_FOLDER
   let siteDetail
 
@@ -312,8 +334,9 @@ const siteSingleDetailTemplate = (siteKey, type, activeFrame) => {
     const location = siteDetail.get('location')
 
     template.push(
-      openInNewTabMenuItem(location, undefined, siteDetail.get('partitionNumber')),
+      openInNewTabMenuItem(location, siteDetail.get('partitionNumber')),
       openInNewPrivateTabMenuItem(location),
+      openInNewPrivateTabMenuItem(location, undefined, true),
       openInNewWindowMenuItem(location, undefined, siteDetail.get('partitionNumber')),
       openInNewSessionTabMenuItem(location),
       copyAddressMenuItem('copyLinkAddress', location),
@@ -367,6 +390,17 @@ const siteSingleDetailTemplate = (siteKey, type, activeFrame) => {
       addBookmarkMenuItem('addBookmark', bookmarkUtil.getDetailFromFrame(activeFrame), siteDetail, true),
       addFolderMenuItem(siteDetail, true)
     )
+  }
+
+  if (paymentsEnabled && (type === siteTags.HISTORY || type === siteTags.BOOKMARK)) {
+    let location = siteDetail.get('location')
+    let enabled = ledgerUtil.shouldShowMenuOption(state, location)
+    if (enabled) {
+      template.push(
+        CommonMenu.separatorMenuItem,
+        addToPublisherListMenuItem(location)
+      )
+    }
   }
 
   return template
@@ -488,20 +522,21 @@ function tabTemplateInit (frameProps) {
   //   }
   // })
 
-  const frameToSkip = frameProps.get('key')
-  const frameList = frames.map((frame) => {
-    return {
-      frameKey: frame.get('key'),
-      tabId: frame.get('tabId'),
-      muted: frame.get('key') !== frameToSkip && frame.get('audioPlaybackActive')
-    }
-  })
-
   template.push(CommonMenu.separatorMenuItem,
     {
       label: locale.translation('muteOtherTabs'),
       click: () => {
-        windowActions.muteAllAudio(frameList)
+        // only select frames which are not the current frame and are not muted
+        const otherFrames = frames.filter(frame =>
+          frame.get('key') !== frameProps.get('key') &&
+          frame.get('audioPlaybackActive') === true
+        )
+        const actionCommands = otherFrames.map(frame => ({
+          tabId: frame.get('tabId'),
+          frameKey: frame.get('key'),
+          muted: true
+        }))
+        windowActions.muteAllAudio(actionCommands)
       }
     })
 
@@ -549,6 +584,19 @@ function tabTemplateInit (frameProps) {
       appActions.closeTabsToLeftMenuItemClicked(tabId)
     }
   }, CommonMenu.separatorMenuItem)
+
+  // debug options, only in development
+  if (getSetting(settings.DEBUG_ALLOW_MANUAL_TAB_DISCARD) === true) {
+    template.push(
+      {
+        label: 'Discard',
+        click: (item) => {
+          appActions.discardTabRequested(tabId)
+        }
+      },
+      CommonMenu.separatorMenuItem
+    )
+  }
 
   template.push(Object.assign({},
     CommonMenu.reopenLastClosedTabItem(),
@@ -641,17 +689,12 @@ function hamburgerTemplateInit (location, e) {
     CommonMenu.separatorMenuItem
   ]
 
-  if (!isLinux) {
-    helpSubmenu.push(
-      CommonMenu.checkForUpdateMenuItem(),
-      CommonMenu.separatorMenuItem)
-  }
-
   helpSubmenu.push(CommonMenu.submitFeedbackMenuItem())
 
   const template = [
     CommonMenu.newTabMenuItem(),
     CommonMenu.newPrivateTabMenuItem(),
+    CommonMenu.newTorTabMenuItem(false),
     CommonMenu.newPartitionedTabMenuItem(),
     CommonMenu.newWindowMenuItem(),
     CommonMenu.separatorMenuItem,
@@ -708,7 +751,7 @@ function hamburgerTemplateInit (location, e) {
   return menuUtil.sanitizeTemplateItems(template)
 }
 
-const openInNewTabMenuItem = (url, isPrivate, partitionNumber, openerTabId) => {
+const openInNewTabMenuItem = (url, partitionNumber, openerTabId) => {
   const active = getSetting(settings.SWITCH_TO_NEW_TABS) === true
   if (Array.isArray(url) && Array.isArray(partitionNumber)) {
     return {
@@ -716,8 +759,7 @@ const openInNewTabMenuItem = (url, isPrivate, partitionNumber, openerTabId) => {
       click: () => {
         for (let i = 0; i < url.length; ++i) {
           appActions.createTabRequested({
-            url: url[i],
-            isPrivate,
+            url: sanitizeUrl(url[i]),
             partitionNumber: partitionNumber[i],
             openerTabId,
             active
@@ -730,8 +772,7 @@ const openInNewTabMenuItem = (url, isPrivate, partitionNumber, openerTabId) => {
       label: locale.translation('openInNewTab'),
       click: () => {
         appActions.createTabRequested({
-          url,
-          isPrivate,
+          url: sanitizeUrl(url),
           partitionNumber,
           openerTabId,
           active
@@ -750,16 +791,17 @@ const openAllInNewTabsMenuItem = (folderDetail) => {
   }
 }
 
-const openInNewPrivateTabMenuItem = (url, openerTabId) => {
+const openInNewPrivateTabMenuItem = (url, openerTabId, isTor) => {
   const active = getSetting(settings.SWITCH_TO_NEW_TABS) === true
   if (Array.isArray(url)) {
     return {
-      label: locale.translation('openInNewPrivateTabs'),
+      label: locale.translation(isTor ? 'openInNewTorTabs' : 'openInNewPrivateTabs'),
       click: () => {
         for (let i = 0; i < url.length; ++i) {
           appActions.createTabRequested({
-            url: url[i],
+            url: sanitizeUrl(url[i]),
             isPrivate: true,
+            isTor,
             openerTabId,
             active
           })
@@ -768,11 +810,12 @@ const openInNewPrivateTabMenuItem = (url, openerTabId) => {
     }
   } else {
     return {
-      label: locale.translation('openInNewPrivateTab'),
+      label: locale.translation(isTor ? 'openInNewTorTab' : 'openInNewPrivateTab'),
       click: () => {
         appActions.createTabRequested({
-          url,
+          url: sanitizeUrl(url),
           isPrivate: true,
+          isTor,
           openerTabId,
           active
         })
@@ -781,11 +824,16 @@ const openInNewPrivateTabMenuItem = (url, openerTabId) => {
   }
 }
 
-const openInNewWindowMenuItem = (location, isPrivate, partitionNumber) => {
+const openInNewWindowMenuItem = (location, isPrivate, partitionNumber, isTor) => {
   return {
     label: locale.translation('openInNewWindow'),
     click: () => {
-      appActions.newWindow({ location, isPrivate, partitionNumber })
+      appActions.newWindow({
+        location: sanitizeUrl(location),
+        isPrivate,
+        isTor,
+        partitionNumber
+      })
     }
   }
 }
@@ -798,7 +846,7 @@ const openInNewSessionTabMenuItem = (url, openerTabId) => {
       click: (item) => {
         for (let i = 0; i < url.length; ++i) {
           appActions.createTabRequested({
-            url: url[i],
+            url: sanitizeUrl(url[i]),
             isPartitioned: true,
             openerTabId,
             active
@@ -811,7 +859,7 @@ const openInNewSessionTabMenuItem = (url, openerTabId) => {
       label: locale.translation('openInNewSessionTab'),
       click: (item) => {
         appActions.createTabRequested({
-          url,
+          url: sanitizeUrl(url),
           isPartitioned: true,
           openerTabId,
           active
@@ -860,10 +908,13 @@ const searchSelectionMenuItem = (location) => {
       if (location) {
         let activeFrame = windowStore.getState().get('activeFrameKey')
         let frame = windowStore.getFrame(activeFrame)
-        let searchUrl = appStoreRenderer.state.getIn(['searchDetail', 'searchURL']).replace('{searchTerms}', encodeURIComponent(location))
+        const searchUrl = getSearchUrl(frame, location)
+        const isPrivate = frame.get('isPrivate')
+        const isTor = frameStateUtil.isTor(frame)
         appActions.createTabRequested({
-          url: searchUrl,
-          isPrivate: frame.get('isPrivate'),
+          url: sanitizeUrl(searchUrl),
+          isPrivate,
+          isTor,
           partitionNumber: frame.get('partitionNumber'),
           windowId: frame.get('windowId')
         })
@@ -882,14 +933,26 @@ const showDefinitionMenuItem = (selectionText) => {
   }
 }
 
+const addToPublisherListMenuItem = (location) => {
+  return {
+    label: locale.translation('addToPublisherList'),
+    click: () => {
+      appActions.addPublisherToLedger(location)
+    }
+  }
+}
+
 function addLinkMenu (link, frame) {
   const template = []
   if (!frame.get('isPrivate')) {
-    template.push(openInNewTabMenuItem(link, frame.get('isPrivate'), frame.get('partitionNumber'), frame.get('tabId')))
+    template.push(openInNewTabMenuItem(link, frame.get('partitionNumber'), frame.get('tabId')))
   }
+  const isTor = frameStateUtil.isTor(frame)
   template.push(
-    openInNewPrivateTabMenuItem(link, frame.get('tabId')),
-    openInNewWindowMenuItem(link, frame.get('isPrivate'), frame.get('partitionNumber')),
+    openInNewPrivateTabMenuItem(link, frame.get('tabId'), isTor),
+    openInNewPrivateTabMenuItem(link, frame.get('tabId'), !isTor),
+    openInNewWindowMenuItem(link, frame.get('isPrivate'),
+      frame.get('partitionNumber'), isTor),
     CommonMenu.separatorMenuItem,
     openInNewSessionTabMenuItem(link, frame.get('tabId')),
     CommonMenu.separatorMenuItem)
@@ -920,6 +983,7 @@ function mainTemplateInit (nodeProps, frame, tab) {
   const isTextSelected = nodeProps.selectionText && nodeProps.selectionText.length > 0
   const isAboutPage = aboutUrls.has(frame.get('location'))
   const isPrivate = frame.get('isPrivate')
+  const isTor = isPrivate && frameStateUtil.isTor(frame)
 
   if (isLink) {
     template = addLinkMenu(nodeProps.linkURL, frame)
@@ -935,9 +999,11 @@ function mainTemplateInit (nodeProps, frame, tab) {
         click: (item) => {
           if (nodeProps.srcURL) {
             appActions.createTabRequested({
-              url: nodeProps.srcURL,
+              url: sanitizeUrl(nodeProps.srcURL),
               openerTabId: frame.get('tabId'),
-              partition: frameStateUtil.getPartitionFromNumber(frame.get('partitionNumber'), isPrivate),
+              isPrivate,
+              isTor,
+              partitionNumber: frame.get('partitionNumber'),
               active: active
             })
           }
@@ -947,32 +1013,23 @@ function mainTemplateInit (nodeProps, frame, tab) {
       {
         label: locale.translation('copyImage'),
         click: (item) => {
-          if (nodeProps.srcURL) {
-            if (urlParse(nodeProps.srcURL).protocol === 'data:') {
-              appActions.dataURLCopied(nodeProps.srcURL, `<img src='${nodeProps.srcURL}>`, nodeProps.srcURL)
-            } else {
-              getBase64FromImageUrl(nodeProps.srcURL).then((dataURL) =>
-                appActions.dataURLCopied(dataURL, `<img src='${nodeProps.srcURL}>`, nodeProps.srcURL))
-            }
-          }
+          appActions.copyImage(frame.get('tabId'), nodeProps.x, nodeProps.y)
         }
       },
       copyAddressMenuItem('copyImageAddress', nodeProps.srcURL)
     )
-    if (getSetting(settings.DEFAULT_SEARCH_ENGINE) === 'Google' &&
-      nodeProps.srcURL && urlParse(nodeProps.srcURL).protocol !== 'data:') {
+    const searchUrl = getSearchUrl(frame, nodeProps.srcURL || '')
+    if (searchUrl.startsWith('https://www.google.com/search?q') &&
+      nodeProps.srcURL &&
+      urlParse(nodeProps.srcURL).protocol !== 'data:') {
       template.push(
         {
           label: locale.translation('searchImage'),
           click: () => {
-            let activeFrame = windowStore.getState().get('activeFrameKey')
-            let frame = windowStore.getFrame(activeFrame)
-            let searchUrl = appStoreRenderer.state.getIn(['searchDetail', 'searchURL'])
-              .replace('{searchTerms}', encodeURIComponent(nodeProps.srcURL))
-              .replace('?q', 'byimage?image_url')
             appActions.createTabRequested({
-              url: searchUrl,
+              url: sanitizeUrl(searchUrl.replace('?q', 'byimage?image_url')),
               isPrivate,
+              isTor,
               partitionNumber: frame.get('partitionNumber')
             })
           }
@@ -1182,6 +1239,9 @@ function mainTemplateInit (nodeProps, frame, tab) {
         info['menuItemId'] = extensionContextMenu.menuItemId
         if (extensionContextMenu.properties.parentId) {
           info['parentMenuItemId'] = extensionContextMenu.properties.parentId
+          if (!templateMap[extensionContextMenu.properties.parentId]) {
+            return
+          }
           if (templateMap[extensionContextMenu.properties.parentId].submenu === undefined) {
             templateMap[extensionContextMenu.properties.parentId].submenu = []
           }
@@ -1287,6 +1347,7 @@ function onNewTabContextMenu (target) {
   const menuTemplate = [
     CommonMenu.newTabMenuItem(),
     CommonMenu.newPrivateTabMenuItem(),
+    CommonMenu.newTorTabMenuItem(),
     CommonMenu.newPartitionedTabMenuItem(),
     CommonMenu.newWindowMenuItem()
   ]
@@ -1310,10 +1371,9 @@ function onDownloadsToolbarContextMenu (downloadId, downloadItem, e) {
 
 function onUrlBarContextMenu (e) {
   e.stopPropagation()
-  const searchDetail = appStoreRenderer.state.get('searchDetail')
   const windowState = windowStore.getState()
   const activeFrame = frameStateUtil.getActiveFrame(windowState)
-  const inputMenu = Menu.buildFromTemplate(urlBarTemplateInit(searchDetail, activeFrame, e))
+  const inputMenu = Menu.buildFromTemplate(urlBarTemplateInit(activeFrame, e))
   inputMenu.popup(getCurrentWindow())
 }
 
@@ -1334,6 +1394,7 @@ function onSiteDetailContextMenu (data, type, activeFrame, e) {
 function onLedgerContextMenu (location, hostPattern) {
   const template = [openInNewTabMenuItem(location),
     openInNewPrivateTabMenuItem(location),
+    openInNewPrivateTabMenuItem(location, undefined, true),
     openInNewSessionTabMenuItem(location),
     copyAddressMenuItem('copyLinkAddress', location),
     CommonMenu.separatorMenuItem,

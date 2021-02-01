@@ -194,6 +194,14 @@ const aboutActions = {
     ipc.sendToHost(messages.CONTEXT_MENU_OPENED, nodeProps, contextMenuType)
   },
 
+  /**
+   * Emitted when tor tab setting is changed
+   * @param {boolean} torEnabled - Whether tor is enabled for that tab
+   */
+  recreateTorTab: function (torEnabled) {
+    ipc.sendToHost(messages.RECREATE_TOR_TAB, torEnabled)
+  },
+
   downloadRevealed: function (downloadId) {
     aboutActions.dispatchAction({
       actionType: appConstants.APP_DOWNLOAD_REVEALED,
@@ -360,6 +368,15 @@ const aboutActions = {
     aboutActions.dispatchAction({
       actionType: appConstants.APP_RENDER_TO_PDF,
       savePath: savePath
+    })
+  },
+
+  /**
+   * Launch into Brave Core using path discovered during init
+   */
+  launchBraveCore: function () {
+    aboutActions.dispatchAction({
+      actionType: appConstants.APP_LAUNCH_BRAVE_CORE
     })
   }
 }

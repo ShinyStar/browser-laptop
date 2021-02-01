@@ -11,12 +11,13 @@ require('v8-compile-cache')
 
 const CrashHerald = require('./crash-herald')
 const telemetry = require('./telemetry')
+const {setUserPref} = require('../js/state/userPrefs')
 
 // set initial base line checkpoint
 telemetry.setCheckpoint('init')
 
 const handleUncaughtError = (stack, message) => {
-  muon.crashReporter.setCrashKeyValue('javascript-info', JSON.stringify({stack, message}))
+  muon.crashReporter.setJavascriptInfoCrashValue(JSON.stringify({stack, message}))
   muon.crashReporter.dumpWithoutCrashing()
 
   if (!ready) {
@@ -48,12 +49,14 @@ process.on('unhandledRejection', function (reason, promise) {
 
 process.on('warning', warning => console.warn(warning.stack))
 
-if (process.platform === 'win32') {
-  require('./windowsInit')
-}
+let initState
 
-if (process.platform === 'linux') {
+if (process.platform === 'win32') {
+  initState = require('./windowsInit')()
+} else if (process.platform === 'linux') {
   require('./linuxInit')
+} else if (process.platform === 'darwin') {
+  initState = require('./darwinInit')()
 }
 
 const electron = require('electron')
@@ -64,6 +67,7 @@ const updater = require('./updater')
 const Importer = require('./importer')
 const messages = require('../js/constants/messages')
 const appActions = require('../js/actions/appActions')
+const tabActions = require('./common/actions/tabActions')
 const SessionStore = require('./sessionStore')
 const {startSessionSaveInterval} = require('./sessionStoreShutdown')
 const appStore = require('../js/stores/appStore')
@@ -83,8 +87,11 @@ const privacy = require('../js/state/privacy')
 const settings = require('../js/constants/settings')
 const {getSetting} = require('../js/settings')
 const BookmarksExporter = require('./browser/bookmarksExporter')
+const {getIsObsolete} = require('./common/state/obsoletionStateHelper')
 
 app.commandLine.appendSwitch('enable-features', 'BlockSmallPluginContent,PreferHtmlOverPlugins')
+// Fix https://github.com/brave/browser-laptop/issues/15337
+app.commandLine.appendSwitch('disable-databases')
 
 // Domains to accept bad certs for. TODO: Save the accepted cert fingerprints.
 let acceptCertDomains = {}
@@ -141,18 +148,22 @@ const notifyCertError = (webContents, url, error, cert) => {
     fingerprint: cert.fingerprint
   }
 
-  // Tell the page to show an unlocked icon. Note this is sent to the main
-  // window webcontents, not the webview webcontents
-  let sender = webContents.hostWebContents || webContents
-  sender.send(messages.CERT_ERROR, {
+  // Load the certificate error page
+  // and provide details about the error,
+  // including enough data for in-page actions to force the
+  // insecure page to load or show the certificate.
+  tabActions.setContentsError(webContents.getId(), {
     url,
     error,
     cert,
     tabId: webContents.getId()
   })
+  appActions.loadURLRequested(webContents.getId(), 'about:certerror')
 }
 
 app.on('ready', () => {
+  setUserPref('safebrowsing.enabled', false)
+
   app.on('certificate-error', (e, webContents, url, error, cert, resourceType, strictEnforcement, expiredPreviousDecision, muonCb) => {
     let host = urlParse(url).host
     if (host && acceptCertDomains[host] === true) {
@@ -179,9 +190,16 @@ app.on('ready', () => {
   })
 
   loadAppStatePromise.then((initialImmutableState) => {
+    // merge state which was set during optional platform-specific init
+    initialImmutableState = initialImmutableState.setIn(['about', 'init'],
+        Immutable.fromJS(initState || {}))
+
     // Do this after loading the state
     // For tests we always want to load default app state
-    const loadedPerWindowImmutableState = initialImmutableState.get('perWindowState')
+    const isObsolete = getIsObsolete(initialImmutableState)
+    const loadedPerWindowImmutableState = isObsolete
+                ? Immutable.List()
+                : initialImmutableState.get('perWindowState')
     initialImmutableState = initialImmutableState.delete('perWindowState')
     // Restore map order after load
     appActions.setState(initialImmutableState)
@@ -208,6 +226,7 @@ app.on('ready', () => {
         appActions.newWindow()
       }
     } else {
+      const lastIndex = loadedPerWindowImmutableState.size - 1
       loadedPerWindowImmutableState
         .sort((a, b) => {
           let comparison = 0
@@ -222,8 +241,12 @@ app.on('ready', () => {
 
           return comparison
         })
-        .forEach((wndState) => {
-          appActions.newWindow(undefined, undefined, wndState)
+        .forEach((wndState, i) => {
+          const isLastWindow = i === lastIndex
+          if (CmdLine.shouldDebugWindowEvents && isLastWindow) {
+            console.log(`The restored window which should get focus has ${wndState.get('frames').size} frames`)
+          }
+          appActions.newWindow(undefined, isLastWindow ? undefined : { inactive: true }, wndState, true)
         })
     }
     process.emit(messages.APP_INITIALIZED)
@@ -251,7 +274,8 @@ app.on('ready', () => {
 
     if (CmdLine.newWindowURL()) {
       appActions.newWindow(Immutable.fromJS({
-        location: CmdLine.newWindowURL()
+        location: CmdLine.newWindowURL(),
+        isObsoleteAction: true
       }))
     }
 
@@ -286,7 +310,7 @@ app.on('ready', () => {
             appActions.hideNotification(message)
           }
         }
-        if (prefsRestartLastValue[config] === undefined) {
+        if (prefsRestartLastValue[config] === undefined && typeof value === 'boolean') {
           prefsRestartLastValue[config] = value
         }
       }

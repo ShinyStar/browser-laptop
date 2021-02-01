@@ -6,11 +6,12 @@ const Immutable = require('immutable')
 
 // Constants
 const config = require('../constants/config')
+const appConfig = require('../constants/appConfig')
 const settings = require('../constants/settings')
 
 // Actions
 const windowActions = require('../actions/windowActions')
-const webviewActions = require('../actions/webviewActions')
+const tabActions = require('../../app/common/actions/tabActions')
 
 // State
 const {makeImmutable} = require('../../app/common/state/immutableUtil')
@@ -48,22 +49,25 @@ function getFrames (state) {
   return state.get('frames')
 }
 
+function getFrameKeys (state) {
+  return state.get('frames', Immutable.List()).map(frame => frame.get('key'))
+}
+
 function getSortedFrames (state) {
-  return state.get('frames').sort(comparatorByKeyAsc)
+  return state.get('frames', Immutable.List()).sort(comparatorByKeyAsc)
 }
 
 function getSortedFrameKeys (state) {
-  return state.get('frames')
-    .sort(comparatorByKeyAsc)
+  return getSortedFrames(state)
     .map(frame => frame.get('key'))
 }
 
 function getPinnedFrames (state) {
-  return state.get('frames').filter((frame) => frame.get('pinnedLocation'))
+  return state.get('frames', Immutable.List()).filter((frame) => frame.get('pinnedLocation'))
 }
 
 function getNonPinnedFrames (state) {
-  return state.get('frames').filter((frame) => !frame.get('pinnedLocation')) || Immutable.List()
+  return state.get('frames', Immutable.List()).filter((frame) => !frame.get('pinnedLocation'))
 }
 
 function getFrameIndex (state, frameKey) {
@@ -202,7 +206,8 @@ const getTabIdByFrameKey = (state, frameKey) => {
 
 function getActiveFrame (state) {
   const activeFrameIndex = getActiveFrameIndex(state)
-  return state.get('frames').get(activeFrameIndex)
+  const frames = state.get('frames')
+  return frames ? frames.get(activeFrameIndex) : null
 }
 
 // Returns the same as the active frame's location, but returns the requested
@@ -295,10 +300,6 @@ function getPartitionNumber (partition) {
   return Number((matches && matches[1]) || 0)
 }
 
-function isPrivatePartition (partition) {
-  return partition && !partition.startsWith('persist:')
-}
-
 function isSessionPartition (partition) {
   return partition && partition.startsWith('persist:partition-')
 }
@@ -320,8 +321,6 @@ const frameOptsFromFrame = (frame) => {
   return frame
     .delete('key')
     .delete('parentFrameKey')
-    .delete('activeShortcut')
-    .delete('activeShortcutDetails')
     .delete('index')
     .deleteIn(['navbar', 'urlbar', 'suggestions'])
 }
@@ -331,7 +330,7 @@ const frameOptsFromFrame = (frame) => {
 * @return Immutable top level application state ready to merge back in
 */
 function addFrame (state, frameOpts, newKey, partitionNumber, openInForeground, insertionIndex) {
-  const frames = state.get('frames')
+  const frames = state.get('frames', Immutable.List())
 
   const location = frameOpts.location // page url
   const displayURL = frameOpts.displayURL == null ? location : frameOpts.displayURL
@@ -343,6 +342,8 @@ function addFrame (state, frameOpts, newKey, partitionNumber, openInForeground, 
   // Only add pin requests if it's not already added
   const isPinned = frameOpts.isPinned
   delete frameOpts.isPinned
+
+  delete frameOpts.index
 
   // TODO: longer term get rid of parentFrameKey completely instead of
   // calculating it here.
@@ -432,9 +433,9 @@ function getFrameTabPageIndex (state, tabId, tabsPerTabPage = getSetting(setting
   return Math.floor(index / tabsPerTabPage)
 }
 
-function onFindBarHide (frameKey) {
+function onFindBarHide (frameKey, tabId) {
   windowActions.setFindbarShown(frameKey, false)
-  webviewActions.stopFindInPage()
+  tabActions.stopFindInPageRequest(tabId)
   windowActions.setFindDetail(frameKey, Immutable.fromJS({
     internalFindStatePresent: false,
     numberOfMatches: -1,
@@ -481,6 +482,13 @@ const isFirstFrameKeyInTabPage = (state, frameKey) => {
     .slice(startingFrameIndex, startingFrameIndex + tabsPerTabPage).first()
 
   return firstFrame && firstFrame.get('key') === frameKey
+}
+
+/**
+ * Check if frame or tab object is associated with a tor private tab
+ */
+function isTor (frame) {
+  return !!(frame && frame.get('partition') === appConfig.tor.partition)
 }
 
 const getTabPageIndex = (state) => {
@@ -767,9 +775,9 @@ module.exports = {
   getHistory,
   isFrameKeyPinned,
   getNonPinnedFrameCount,
-  isPrivatePartition,
   isSessionPartition,
   getFrames,
+  getFrameKeys,
   getSortedFrames,
   getPinnedFrames,
   getNonPinnedFrames,
@@ -803,6 +811,7 @@ module.exports = {
   onFindBarHide,
   getTotalBlocks,
   isPinned,
+  isTor,
   isFirstFrameKeyInTabPage,
   getTabPageIndex,
   updateTabPageIndex,

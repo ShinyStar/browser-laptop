@@ -9,13 +9,16 @@ const electron = require('electron')
 const session = electron.session
 const BrowserWindow = electron.BrowserWindow
 const webContents = electron.webContents
+const webContentsCache = require('./browser/webContentsCache')
 const appActions = require('../js/actions/appActions')
 const appConfig = require('../js/constants/appConfig')
 const hostContentSettings = require('./browser/contentSettings/hostContentSettings')
 const downloadStates = require('../js/constants/downloadStates')
 const urlParse = require('./common/urlParse')
 const getSetting = require('../js/settings').getSetting
+const {getExtensionsPath} = require('../js/lib/appUrlUtil')
 const appUrlUtil = require('../js/lib/appUrlUtil')
+const faviconUtil = require('../js/lib/faviconUtil')
 const siteSettings = require('../js/state/siteSettings')
 const settings = require('../js/constants/settings')
 const userPrefs = require('../js/state/userPrefs')
@@ -26,17 +29,22 @@ const ipcMain = electron.ipcMain
 const app = electron.app
 const path = require('path')
 const getOrigin = require('../js/lib/urlutil').getOrigin
+const {isTorrentFile} = require('./browser/webtorrent')
 const {adBlockResourceName} = require('./adBlock')
 const {updateElectronDownloadItem} = require('./browser/electronDownloadItem')
 const {fullscreenOption} = require('./common/constants/settingsEnums')
 const isThirdPartyHost = require('./browser/isThirdPartyHost')
 const extensionState = require('./common/state/extensionState')
 const ledgerUtil = require('./common/lib/ledgerUtil')
-const {cookieExceptions, refererExceptions} = require('../js/data/siteHacks')
+const {cookieExceptions, isRefererException} = require('../js/data/siteHacks')
 const {getBraverySettingsCache, updateBraverySettingsCache} = require('./common/cache/braverySettingsCache')
+const {shouldDebugTabEvents} = require('./cmdLine')
+const {getTorSocksProxy} = require('./channel')
+const tor = require('./tor')
 
 let appStore = null
 
+const tabMessageBox = require('./browser/tabMessageBox')
 const beforeSendHeadersFilteringFns = []
 const beforeRequestFilteringFns = []
 const beforeRedirectFilteringFns = []
@@ -56,6 +64,11 @@ const registeredSessions = {}
  * Maps permission notification bar messages to their callback
  */
 const permissionCallbacks = {}
+
+/**
+ * A set to keep track of URLs fetching favicons that need special treatment later
+ */
+const faviconURLs = new Set()
 
 const getBraverySettingsForUrl = (url, appState, isPrivate) => {
   const cachedBraverySettings = getBraverySettingsCache(url, isPrivate)
@@ -90,6 +103,13 @@ module.exports.registerHeadersReceivedFilteringCB = (filteringFn) => {
   headersReceivedFilteringFns.push(filteringFn)
 }
 
+// Protocols which are safe to load in tor tabs
+const whitelistedTorProtocols = ['http:', 'https:', 'chrome-extension:', 'chrome-devtools:']
+if (process.env.NODE_ENV === 'development') {
+  // Needed for connection to webpack local server
+  whitelistedTorProtocols.push('ws:')
+}
+
 /**
  * Register for notifications for webRequest.onBeforeRequest for a particular
  * session.
@@ -98,6 +118,35 @@ module.exports.registerHeadersReceivedFilteringCB = (filteringFn) => {
 function registerForBeforeRequest (session, partition) {
   const isPrivate = module.exports.isPrivate(partition)
   session.webRequest.onBeforeRequest((details, muonCb) => {
+    if (details.url &&
+      (details.url.startsWith('chrome://brave') || details.url.startsWith('brave://')) &&
+      details.tabId !== -1) {
+      muonCb({ cancel: true })
+      return
+    }
+    if (partition === appConfig.tor.partition) {
+      if (!details.url) {
+        muonCb({ cancel: true })
+        return
+      }
+      // To minimize leakage risk, only allow whitelisted protocols in Tor
+      // sessions
+      const protocol = urlParse(details.url).protocol
+      if (!whitelistedTorProtocols.includes(protocol)) {
+        onBlockedInTor(details, muonCb)
+        return
+      }
+    } else {
+      const hostname = urlParse(details.url).hostname
+      // US-ASCII only in `.onion', so no need for locale-dependent
+      // case-insensitive comparisons.
+      if (typeof hostname === 'string' &&
+          hostname.toLowerCase().endsWith('.onion')) {
+        onBlockedOutsideTor(details, muonCb)
+        return
+      }
+    }
+
     if (process.env.NODE_ENV === 'development') {
       let page = appUrlUtil.getGenDir(details.url)
       if (page) {
@@ -109,6 +158,15 @@ function registerForBeforeRequest (session, partition) {
       }
     }
 
+    const url = details.url
+    // filter out special urls for fetching favicons
+    if (faviconUtil.isWrappedFaviconUrl(url)) {
+      const redirectURL = faviconUtil.unwrapFaviconUrl(url)
+      faviconURLs.add(redirectURL)
+      muonCb({ redirectURL })
+      return
+    }
+
     if (shouldIgnoreUrl(details)) {
       muonCb({})
       return
@@ -117,8 +175,16 @@ function registerForBeforeRequest (session, partition) {
     const firstPartyUrl = module.exports.getMainFrameUrl(details)
     // this can happen if the tab is closed and the webContents is no longer available
     if (!firstPartyUrl) {
-      muonCb({ cancel: true })
+      muonCb({})
       return
+    }
+
+    if (!isPrivate && module.exports.isResourceEnabled('ledger') && module.exports.isResourceEnabled('ledgerMedia')) {
+      // Ledger media
+      const provider = ledgerUtil.getMediaProvider(url, firstPartyUrl, details.referrer)
+      if (provider) {
+        appActions.onLedgerMediaData(url, provider, details)
+      }
     }
 
     for (let i = 0; i < beforeRequestFilteringFns.length; i++) {
@@ -201,21 +267,12 @@ function registerForBeforeRequest (session, partition) {
       }
     }
     // Redirect to non-script version of DDG when it's blocked
-    const url = details.url
     if (details.resourceType === 'mainFrame' &&
       url.startsWith('https://duckduckgo.com/?q') &&
     module.exports.isResourceEnabled('noScript', url, isPrivate)) {
       muonCb({redirectURL: url.replace('?q=', 'html?q=')})
     } else {
       muonCb({})
-    }
-
-    if (module.exports.isResourceEnabled('ledger') && module.exports.isResourceEnabled('ledgerMedia')) {
-      // Ledger media
-      const provider = ledgerUtil.getMediaProvider(url)
-      if (provider) {
-        appActions.onLedgerMediaData(url, provider, details.tabId)
-      }
     }
   })
 }
@@ -245,12 +302,13 @@ function registerForBeforeRedirect (session, partition) {
 module.exports.applyCookieSetting = (requestHeaders, url, firstPartyUrl, isPrivate) => {
   const cookieSetting = module.exports.isResourceEnabled(appConfig.resourceNames.COOKIEBLOCK, firstPartyUrl, isPrivate)
   if (cookieSetting) {
-    const parsedTargetUrl = urlParse(url || '')
-    const parsedFirstPartyUrl = urlParse(firstPartyUrl)
+    const targetHostname = urlParse(url || '').hostname
+    const firstPartyHostname = urlParse(firstPartyUrl).hostname
     const targetOrigin = getOrigin(url)
+    const referer = requestHeaders['Referer']
 
     if (cookieSetting === 'blockAllCookies' ||
-      isThirdPartyHost(parsedFirstPartyUrl.hostname, parsedTargetUrl.hostname)) {
+      isThirdPartyHost(firstPartyHostname, targetHostname)) {
       let hasCookieException = false
       const firstPartyOrigin = getOrigin(firstPartyUrl)
       if (cookieExceptions.hasOwnProperty(firstPartyOrigin)) {
@@ -268,20 +326,19 @@ module.exports.applyCookieSetting = (requestHeaders, url, firstPartyUrl, isPriva
           }
         }
       }
-      // Clear cookie and referer on third-party requests
+
+      // Clear cookie on third-party requests
       if (requestHeaders['Cookie'] &&
           firstPartyOrigin !== pdfjsOrigin && !hasCookieException) {
         requestHeaders['Cookie'] = undefined
       }
     }
 
-    const referer = requestHeaders['Referer']
     if (referer &&
         cookieSetting !== 'allowAllCookies' &&
-        !refererExceptions.includes(parsedTargetUrl.hostname) &&
-        targetOrigin !== getOrigin(referer)) {
-      // Unless the setting is 'allow all cookies', spoof the referer if it
-      // is a cross-origin referer
+        !isRefererException(targetHostname) &&
+        isThirdPartyHost(targetHostname, urlParse(referer).hostname)) {
+      // Spoof third party referer
       requestHeaders['Referer'] = targetOrigin
     }
   }
@@ -301,9 +358,15 @@ function registerForBeforeSendHeaders (session, partition) {
   const isPrivate = module.exports.isPrivate(partition)
 
   session.webRequest.onBeforeSendHeaders(function (details, muonCb) {
+    // strip cookies from all requests fetching favicons
+    if (faviconURLs.has(details.url)) {
+      faviconURLs.delete(details.url)
+      delete details.requestHeaders['Cookie']
+    }
+
     // Using an electron binary which isn't from Brave
     if (shouldIgnoreUrl(details)) {
-      muonCb({})
+      muonCb({ requestHeaders: details.requestHeaders })
       return
     }
 
@@ -312,7 +375,7 @@ function registerForBeforeSendHeaders (session, partition) {
     const firstPartyUrl = module.exports.getMainFrameUrl(details)
     // this can happen if the tab is closed and the webContents is no longer available
     if (!firstPartyUrl) {
-      muonCb({ cancel: true })
+      muonCb({})
       return
     }
 
@@ -345,6 +408,27 @@ function registerForBeforeSendHeaders (session, partition) {
   })
 }
 
+function onBlocked (reasonKey, details, muonCb) {
+  const cb = () => muonCb({cancel: true})
+  if (details.tabId && details.resourceType === 'mainFrame') {
+    tabMessageBox.show(details.tabId, {
+      message: `${locale.translation(reasonKey)}`,
+      title: 'Brave',
+      buttons: [locale.translation('urlWarningOk')]
+    }, cb)
+  } else {
+    cb()
+  }
+}
+
+function onBlockedInTor (details, muonCb) {
+  onBlocked('urlBlockedInTor', details, muonCb)
+}
+
+function onBlockedOutsideTor (details, muonCb) {
+  onBlocked('urlBlockedOutsideTor', details, muonCb)
+}
+
 /**
  * Register for notifications for webRequest.onHeadersReceived for a particular
  * session.
@@ -358,12 +442,28 @@ function registerForHeadersReceived (session, partition) {
       muonCb({})
       return
     }
+    if ((isTorrentFile(details)) && partition === appConfig.tor.partition) {
+      onBlockedInTor(details, muonCb)
+      return
+    }
     const firstPartyUrl = module.exports.getMainFrameUrl(details)
     // this can happen if the tab is closed and the webContents is no longer available
     if (!firstPartyUrl) {
-      muonCb({ cancel: true })
+      muonCb({})
       return
     }
+
+    let parsedTargetUrl = urlParse(details.url || '')
+    let parsedFirstPartyUrl = urlParse(firstPartyUrl)
+    const trackableSecurityHeaders = ['Strict-Transport-Security', 'Expect-CT',
+      'Public-Key-Pins', 'Public-Key-Pins-Report-Only']
+    if (isThirdPartyHost(parsedFirstPartyUrl.hostname, parsedTargetUrl.hostname)) {
+      trackableSecurityHeaders.forEach(function (header) {
+        delete details.responseHeaders[header]
+        delete details.responseHeaders[header.toLowerCase()]
+      })
+    }
+
     for (let i = 0; i < headersReceivedFilteringFns.length; i++) {
       let results = headersReceivedFilteringFns[i](details, isPrivate)
       if (!module.exports.isResourceEnabled(results.resourceName, firstPartyUrl, isPrivate)) {
@@ -381,7 +481,10 @@ function registerForHeadersReceived (session, partition) {
         return
       }
     }
-    muonCb({})
+    muonCb({
+      responseHeaders: details.responseHeaders,
+      statusLine: details.statusLine
+    })
   })
 }
 
@@ -394,7 +497,7 @@ function registerPermissionHandler (session, partition) {
   const isPrivate = module.exports.isPrivate(partition)
   // Keep track of per-site permissions granted for this session.
   let permissions = null
-  session.setPermissionRequestHandler((origin, mainFrameUrl, permissionTypes, muonCb) => {
+  session.setPermissionRequestHandler((mainFrameOrigin, requestingUrl, permissionTypes, muonCb) => {
     if (!permissions) {
       permissions = {
         media: {
@@ -427,35 +530,12 @@ function registerPermissionHandler (session, partition) {
     // TODO(bridiver) - the permission handling should be converted to an action because we should never call `appStore.getState()`
     // Check whether there is a persistent site setting for this host
     const appState = appStore.getState()
-    const isBraveOrigin = origin.startsWith(`chrome-extension://${config.braveExtensionId}/`)
-    const isPDFOrigin = origin.startsWith(`${pdfjsOrigin}/`)
-    let settings
-    let tempSettings
-    if (mainFrameUrl === appUrlUtil.getBraveExtIndexHTML() || isPDFOrigin || isBraveOrigin) {
-      // lookup, display and store site settings by the origin alias
-      origin = isPDFOrigin ? 'PDF Viewer' : 'Brave Browser'
-      // display on all tabs
-      mainFrameUrl = null
-      // Lookup by exact host pattern match since 'Brave Browser' is not
-      // a parseable URL
-      settings = siteSettings.getSiteSettingsForHostPattern(appState.get('siteSettings'), origin)
-      tempSettings = siteSettings.getSiteSettingsForHostPattern(appState.get('temporarySiteSettings'), origin)
-    } else if (mainFrameUrl.startsWith('magnet:')) {
-      // Show "Allow magnet URL to open an external application?", instead of
-      // "Allow null to open an external application?"
-      // This covers an edge case where you open a magnet link tab, then disable Torrent Viewer
-      // and restart Brave. I don't think it needs localization. See 'Brave Browser' above.
-      origin = 'Magnet URL'
-    } else {
-      // Strip trailing slash
-      origin = getOrigin(origin)
-      settings = siteSettings.getSiteSettingsForURL(appState.get('siteSettings'), origin)
-      tempSettings = siteSettings.getSiteSettingsForURL(appState.get('temporarySiteSettings'), origin)
-    }
-
+    const isBraveOrigin = mainFrameOrigin.startsWith(`chrome-extension://${config.braveExtensionId}/`)
+    const isPDFOrigin = mainFrameOrigin.startsWith(`${pdfjsOrigin}/`)
     let response = []
+    let position
 
-    if (origin == null) {
+    if (!requestingUrl) {
       response = new Array(permissionTypes.length)
       response.fill(false, 0, permissionTypes.length)
       muonCb(response)
@@ -466,19 +546,47 @@ function registerPermissionHandler (session, partition) {
       const responseSizeThisIteration = response.length
       const permission = permissionTypes[i]
       const alwaysAllowFullscreen = module.exports.alwaysAllowFullscreen() === fullscreenOption.ALWAYS_ALLOW
+      const isFullscreen = permission === 'fullscreen'
+      const isOpenExternal = permission === 'openExternal'
+
+      let requestingOrigin
+
+      if (requestingUrl === appUrlUtil.getBraveExtIndexHTML() || isPDFOrigin || isBraveOrigin) {
+        // lookup, display and store site settings by the origin alias
+        requestingOrigin = isPDFOrigin ? 'PDF Viewer' : 'Brave Browser'
+        // display on all tabs
+        mainFrameOrigin = null
+      } else {
+        requestingOrigin = getOrigin(requestingUrl) || requestingUrl
+      }
+
+      if (isOpenExternal) {
+        // Open external is a special case since we want to apply the permission
+        // for the entire scheme to avoid cluttering the saved permissions. See
+        // https://github.com/brave/browser-laptop/issues/13642
+        const protocol = urlParse(requestingUrl).protocol
+        requestingOrigin = protocol ? `${protocol} URLs` : requestingUrl
+        mainFrameOrigin = null
+        position = 'global'
+      }
+
+      // Look up by host pattern since requestingOrigin is not necessarily
+      // a parseable URL
+      const settings = siteSettings.getSiteSettingsForHostPattern(appState.get('siteSettings'), requestingOrigin)
+      const tempSettings = siteSettings.getSiteSettingsForHostPattern(appState.get('temporarySiteSettings'), requestingOrigin)
+
       if (!permissions[permission]) {
         console.warn('WARNING: got unregistered permission request', permission)
         response.push(false)
-      } else if (permission === 'fullscreen' &&
+      } else if (permission === 'geolocation' && partition === appConfig.tor.partition) {
+        // Never allow geolocation in Tor mode
+        response.push(false)
+      } else if (isFullscreen && mainFrameOrigin &&
         // The Torrent Viewer extension is always allowed to show fullscreen media
-        origin.startsWith('chrome-extension://' + config.torrentExtensionId)) {
+        mainFrameOrigin.startsWith('chrome-extension://' + config.torrentExtensionId)) {
         response.push(true)
-      } else if (permission === 'fullscreen' && alwaysAllowFullscreen) {
+      } else if (isFullscreen && alwaysAllowFullscreen) {
         // Always allow fullscreen if setting is ON
-        response.push(true)
-      } else if (permission === 'openExternal' && (
-        // The Brave extension and PDFJS are always allowed to open files in an external app
-        isPDFOrigin || isBraveOrigin)) {
         response.push(true)
       } else {
         const permissionName = permission + 'Permission'
@@ -495,9 +603,7 @@ function registerPermissionHandler (session, partition) {
         }
       }
 
-      // Display 'Brave Browser' if the origin is null; ex: when a mailto: link
-      // is opened in a new tab via right-click
-      const message = locale.translation('permissionMessage').replace(/{{\s*host\s*}}/, origin || 'Brave Browser').replace(/{{\s*permission\s*}}/, permissions[permission].action)
+      const message = locale.translation('permissionMessage').replace(/{{\s*host\s*}}/, requestingOrigin).replace(/{{\s*permission\s*}}/, permissions[permission].action)
 
       // If this is a duplicate, clear the previous callback and use the new one
       if (permissionCallbacks[message]) {
@@ -511,9 +617,10 @@ function registerPermissionHandler (session, partition) {
             {text: locale.translation('deny')},
             {text: locale.translation('allow')}
           ],
-          frameOrigin: getOrigin(mainFrameUrl),
+          position,
+          frameOrigin: getOrigin(mainFrameOrigin),
           options: {
-            persist: !!origin,
+            persist: !!requestingOrigin,
             index: i
           },
           message
@@ -530,7 +637,7 @@ function registerPermissionHandler (session, partition) {
           response[index] = result
           if (persist) {
             // remember site setting for this host
-            appActions.changeSiteSetting(origin, permission + 'Permission', result, isPrivate)
+            appActions.changeSiteSetting(requestingOrigin, permission + 'Permission', result, isPrivate)
           }
           if (response.length === permissionTypes.length) {
             permissionCallbacks[message] = null
@@ -575,18 +682,19 @@ function registerForDownloadListener (session) {
 
   session.on('will-download', function (event, item, webContents) {
     if (webContents.isDestroyed()) {
+      if (shouldDebugTabEvents) {
+        console.log(`Tab [DESTROYED] will-download`)
+      }
       event.preventDefault()
       return
     }
 
+    if (shouldDebugTabEvents) {
+      const tabId = webContents.getId ? webContents.getId() : 'NOT_TAB'
+      console.log(`Tab [${tabId}] will-download`)
+    }
     const hostWebContents = webContents.hostWebContents || webContents
     const win = BrowserWindow.fromWebContents(hostWebContents) || BrowserWindow.getFocusedWindow()
-
-    // TODO(bridiver) - move this fix to muon
-    const controller = webContents.controller()
-    if (controller && controller.isValid() && controller.isInitialNavigation()) {
-      webContents.forceClose()
-    }
 
     item.setPrompt(getSetting(settings.DOWNLOAD_ALWAYS_ASK) || false)
 
@@ -626,7 +734,10 @@ function registerForDownloadListener (session) {
   })
 }
 
-function registerForMagnetHandler (session) {
+function registerForMagnetHandler (session, partition) {
+  if (partition === appConfig.tor.partition) {
+    return
+  }
   const webtorrentUrl = appUrlUtil.getTorrentExtUrl('webtorrent.html')
   try {
     if (getSetting(settings.TORRENT_VIEWER_ENABLED)) {
@@ -643,6 +754,34 @@ function registerForMagnetHandler (session) {
   }
 }
 
+module.exports.setTorNewIdentity = (url, tabId) => {
+  const ses = session.fromPartition(appConfig.tor.partition)
+  if (!ses || !url) {
+    return
+  }
+  ses.setTorNewIdentity(url, () => {
+    const tab = webContentsCache.getWebContents(tabId)
+    if (tab && !tab.isDestroyed()) {
+      tab.reload(true)
+    }
+  })
+}
+
+module.exports.relaunchTor = () => {
+  const ses = session.fromPartition(appConfig.tor.partition)
+  if (!ses) {
+    console.log('Tor session no longer exists. Cannot restart Tor.')
+    return
+  }
+  appActions.onTorOnline(false)
+  try {
+    console.log('tor: relaunch')
+    ses.relaunchTor()
+  } catch (e) {
+    appActions.onTorError(`Could not restart Tor: ${e}`)
+  }
+}
+
 function initSession (ses, partition) {
   registeredSessions[partition] = ses
   ses.setEnableBrotli(true)
@@ -650,6 +789,7 @@ function initSession (ses, partition) {
 }
 
 const initPartition = (partition) => {
+  const isTorPartition = partition === appConfig.tor.partition
   // Partitions can only be initialized once the app is ready
   if (!app.isReady()) {
     partitionsToInitialize.push(partition)
@@ -659,6 +799,7 @@ const initPartition = (partition) => {
     return
   }
   initializedPartitions[partition] = true
+
   let fns = [initSession,
     userPrefs.init,
     hostContentSettings.init,
@@ -674,8 +815,25 @@ const initPartition = (partition) => {
   if (isSessionPartition(partition)) {
     options.parent_partition = ''
   }
+  if (isTorPartition) {
+    try {
+      setupTor()
+    } catch (e) {
+      appActions.onTorError(`Could not start Tor: ${e}`)
+    }
+    // TODO(riastradh): Duplicate logic in app/browser/tabs.js.
+    options.isolated_storage = true
+    options.parent_partition = ''
+    options.tor_proxy = getTorSocksProxy()
+    if (process.platform === 'win32') {
+      options.tor_path = path.join(getExtensionsPath('bin'), 'tor.exe')
+    } else {
+      options.tor_path = path.join(getExtensionsPath('bin'), 'tor')
+    }
+  }
 
   let ses = session.fromPartition(partition, options)
+
   fns.forEach((fn) => {
     fn(ses, partition, module.exports.isPrivate(partition))
   })
@@ -690,6 +848,106 @@ const initPartition = (partition) => {
   })
 }
 module.exports.initPartition = initPartition
+
+function setupTor () {
+  let timer = null
+  const setTorErrorOnTimeout = (delay, msg) => {
+    if (timer === null) {
+      timer = setTimeout(() => {
+        appActions.onTorError(msg)
+        console.log(`tor timeout: ${msg}`)
+      }, delay)
+    }
+  }
+  const initialized = () => {
+    if (timer !== null) {
+      clearTimeout(timer)
+      timer = null
+    }
+  }
+  const onTorError = (msg) => {
+    initialized()
+    appActions.onTorError(msg)
+    console.warn(`tor error: ${msg}`)
+  }
+  const onTorOnline = (online) => {
+    initialized()
+    appActions.onTorOnline(online)
+  }
+  // If Tor has not successfully initialized or thrown an error within 20s,
+  // assume it's broken.
+  setTorErrorOnTimeout(20000, 'Tor could not start.')
+  // Set up the tor daemon watcher.  (NOTE: We don't actually start
+  // the tor daemon here; that happens in C++ code.  But we do talk to
+  // its control socket.)
+  const torDaemon = new tor.TorDaemon()
+  torDaemon.setup((err) => {
+    if (err) {
+      onTorError(`Tor failed to make directories: ${err}`)
+      return
+    }
+    torDaemon.on('exit', () => onTorError('The Tor process has exited.'))
+    torDaemon.on('error', (err) => onTorError(`${err}`))
+    torDaemon.on('launch', (socksAddr) => {
+      const version = torDaemon.getVersion()
+      console.log(`tor: daemon listens on ${socksAddr}, version ${version}`)
+      if (version) {
+        appActions.setVersionInfo('Tor', version)
+      }
+      const bootstrapped = (err, progress) => {
+        if (err) {
+          console.warn(`tor: bootstrap ${progress}% error: ${err}`)
+          onTorError(`Tor bootstrap error: ${err}`)
+          return
+        }
+        appActions.onTorInitPercentage(progress)
+      }
+      const networkLiveness = (live) => {
+        if (live) {
+          // Network is now live.
+          onTorOnline(true)
+        } else if (timer === null) {
+          // We were online before; now we are not.
+          onTorOnline(false)
+          // Wait for tor to reconnect.
+          setTorErrorOnTimeout(17000, 'Tor could not reconnect.')
+        }
+      }
+      const circuitEstablished = (err, established) => {
+        if (err && established === null) {
+          onTorError(`Tor circuit error: ${err}`)
+          return
+        }
+        if (established) {
+          // Circuit is now established.
+          onTorOnline(true)
+        } else if (timer === null) {
+          // We were online before; now we are not.
+          onTorOnline(false)
+          // Wait for tor to reconnect.
+          setTorErrorOnTimeout(17000, 'Tor could not reconnect.')
+        }
+      }
+      torDaemon.onBootstrap(bootstrapped, (err) => {
+        if (err) {
+          onTorError(`Tor error subscribing to bootstrap event: ${err}`)
+        }
+        torDaemon.onNetworkLiveness(networkLiveness, (err) => {
+          if (err) {
+            onTorError(`Tor error subscribing to network liveness: ${err}`)
+          }
+          torDaemon.onCircuitEstablished(circuitEstablished, (err) => {
+            if (err) {
+              onTorError(
+                `Tor error subscribing to circuit establishment: ${err}`)
+            }
+          })
+        })
+      })
+    })
+    torDaemon.start()
+  })
+}
 
 const filterableProtocols = ['http:', 'https:', 'ws:', 'wss:', 'magnet:', 'file:']
 
@@ -724,7 +982,11 @@ function shouldIgnoreUrl (details) {
 }
 
 module.exports.isPrivate = (partition) => {
-  return !partition.startsWith('persist:')
+  const ses = session.fromPartition(partition)
+  if (!ses) {
+    return false
+  }
+  return ses.isOffTheRecord()
 }
 
 module.exports.init = (state, action, store) => {
@@ -776,13 +1038,9 @@ module.exports.isResourceEnabled = (resourceName, url, isPrivate) => {
   if (resourceName === 'pdfjs') {
     return getSetting(settings.PDFJS_ENABLED, settingsState)
   }
-  if (resourceName === 'webtorrent') {
-    return getSetting(settings.TORRENT_VIEWER_ENABLED, settingsState)
-  }
 
   if (resourceName === 'webtorrent') {
-    const extension = extensionState.getExtensionById(appState, config.torrentExtensionId)
-    return extension !== undefined ? extension.get('enabled') : false
+    return extensionState.isWebTorrentEnabled(appState)
   }
 
   if (resourceName === 'ledger') {
@@ -841,6 +1099,15 @@ module.exports.clearStorageData = () => {
     let ses = registeredSessions[partition]
     setImmediate(() => {
       ses.clearStorageData.bind(ses)(() => {})
+    })
+  }
+}
+
+module.exports.clearHSTSData = () => {
+  for (let partition in registeredSessions) {
+    let ses = registeredSessions[partition]
+    setImmediate(() => {
+      ses.clearHSTSData.bind(ses)(() => {})
     })
   }
 }

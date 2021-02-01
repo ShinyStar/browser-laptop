@@ -32,7 +32,11 @@ module.exports.cookieExceptions = {
 }
 
 // Third party domains that require a valid referer to work
-module.exports.refererExceptions = ['use.typekit.net', 'cloud.typography.com', 'www.moremorewin.net']
+const refererExceptions = ['use.typekit.net', 'cloud.typography.com', 'www.moremorewin.net']
+const refererExceptionsRegex = [/.*\.fbcdn\.net$/]
+module.exports.isRefererException = (hostname) =>
+  refererExceptions.includes(hostname) || refererExceptionsRegex.some(regex => regex.test(hostname))
+module.exports.getTestRefererException = () => refererExceptions[0]
 
 /**
  * Holds an array of [Primary URL, subresource URL] to allow 3rd party localstorage.
@@ -131,8 +135,10 @@ braveUAWhitelist.forEach((domain) => {
   module.exports.siteHacks[domain] = {
     onBeforeSendHeaders: function (details) {
       let userAgent = details.requestHeaders['User-Agent']
-      userAgent = [userAgent.split('Chrome')[0], 'Brave Chrome', userAgent.split('Chrome')[1]].join('')
-      details.requestHeaders['User-Agent'] = userAgent
+      if (typeof userAgent === 'string') {
+        userAgent = [userAgent.split('Chrome')[0], 'Brave Chrome', userAgent.split('Chrome')[1]].join('')
+        details.requestHeaders['User-Agent'] = userAgent
+      }
       return {
         requestHeaders: details.requestHeaders
       }

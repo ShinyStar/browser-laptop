@@ -17,13 +17,11 @@ const contextMenus = require('../../../../js/contextMenus')
 const {getSetting} = require('../../../../js/settings')
 
 // Components
-const { Transition, TransitionGroup } = require('react-transition-group')
 const Navigator = require('../navigation/navigator')
-const Frame = require('../frame/frame')
+const GuestInstanceRenderer = require('../frame/guestInstanceRenderer')
 const TabPages = require('../tabs/tabPages')
 const TabsToolbar = require('../tabs/tabsToolbar')
 const FindBar = require('./findbar')
-const UpdateBar = require('./updateBar')
 const {NotificationBar, BraveNotificationBar} = require('./notificationBar')
 const DownloadsBar = require('../download/downloadsBar')
 const SiteInfo = require('./siteInfo')
@@ -42,6 +40,10 @@ const ContextMenu = require('../common/contextMenu/contextMenu')
 const PopupWindow = require('./popupWindow')
 const NoScriptInfo = require('./noScriptInfo')
 const CheckDefaultBrowserDialog = require('./checkDefaultBrowserDialog')
+const HrefPreview = require('../frame/hrefPreview')
+const MessageBox = require('../common/messageBox')
+const BrowserButton = require('../common/browserButton')
+const FullScreenWarning = require('../frame/fullScreenWarning')
 
 // Constants
 const appConfig = require('../../../../js/constants/appConfig')
@@ -58,8 +60,9 @@ const defaultBrowserState = require('../../../common/state/defaultBrowserState')
 const shieldState = require('../../../common/state/shieldState')
 const menuBarState = require('../../../common/state/menuBarState')
 const windowState = require('../../../common/state/windowState')
-const updateState = require('../../../common/state/updateState')
 const tabState = require('../../../common/state/tabState')
+const tabMessageBoxState = require('../../../common/state/tabMessageBoxState')
+const obsoletionStateHelper = require('../../../common/state/obsoletionStateHelper')
 
 // Util
 const _ = require('underscore')
@@ -206,82 +209,56 @@ class Main extends React.Component {
 
   exitFullScreen () {
     if (this.props.isFullScreen) {
-      windowActions.setFullScreen(this.props.tabId, false)
+      appActions.tabSetFullScreen(this.props.tabId, false)
     }
   }
 
   registerSwipeListener () {
     // Navigates back/forward on macOS two- and or three-finger swipe
     let trackingFingers = false
-    let startTime = 0
-    let isSwipeOnLeftEdge = false
-    let isSwipeOnRightEdge = false
     let deltaX = 0
-    let deltaY = 0
-    let time
 
     // isSwipeTrackingFromScrollEventsEnabled is only true if "two finger scroll to swipe" is enabled
     ipc.on('scroll-touch-begin', () => {
       if (this.props.mouseInFrame) {
         trackingFingers = true
-        startTime = (new Date()).getTime()
       }
     })
 
-    this.mainWindow.addEventListener('wheel', (e) => {
-      if (trackingFingers) {
-        deltaX = deltaX + e.deltaX
-        deltaY = deltaY + e.deltaY
-        const distanceThresholdX = getSetting(settings.SWIPE_NAV_DISTANCE)
-        const percent = Math.abs(deltaX) / distanceThresholdX
-        if (isSwipeOnRightEdge) {
-          if (percent > 1) {
-            appActions.swipedRight(1)
-          } else {
-            appActions.swipedRight(percent)
-          }
-        } else if (isSwipeOnLeftEdge) {
-          if (percent > 1) {
-            appActions.swipedLeft(1)
-          } else {
-            appActions.swipedLeft(percent)
-          }
-        }
-        time = (new Date()).getTime() - startTime
-      }
-    }, { passive: true })
-
     ipc.on('scroll-touch-end', () => {
       const distanceThresholdX = getSetting(settings.SWIPE_NAV_DISTANCE)
-      const distanceThresholdY = 101
-      const timeThreshold = 80
-      if (trackingFingers && time > timeThreshold && Math.abs(deltaY) < distanceThresholdY) {
-        if (deltaX > distanceThresholdX && isSwipeOnRightEdge) {
-          ipc.emit(messages.SHORTCUT_ACTIVE_FRAME_FORWARD)
-        } else if (deltaX < -distanceThresholdX && isSwipeOnLeftEdge) {
+      if (trackingFingers) {
+        if (deltaX >= distanceThresholdX) {
           ipc.emit(messages.SHORTCUT_ACTIVE_FRAME_BACK)
+        } else if (deltaX <= -distanceThresholdX) {
+          ipc.emit(messages.SHORTCUT_ACTIVE_FRAME_FORWARD)
         }
       }
       appActions.swipedLeft(0)
       appActions.swipedRight(0)
       trackingFingers = false
       deltaX = 0
-      deltaY = 0
-      startTime = 0
     })
 
-    ipc.on('scroll-touch-edge', () => {
+    ipc.on('scroll-touch-edge', (e, dict) => {
       if (trackingFingers) {
-        if (!isSwipeOnRightEdge && deltaX > 0) {
-          isSwipeOnRightEdge = true
-          isSwipeOnLeftEdge = false
-          time = 0
-          deltaX = 0
-        } else if (!isSwipeOnLeftEdge && deltaX < 0) {
-          isSwipeOnLeftEdge = true
-          isSwipeOnRightEdge = false
-          time = 0
-          deltaX = 0
+        deltaX += dict.deltaX
+        const distanceThresholdX = getSetting(settings.SWIPE_NAV_DISTANCE)
+        const percent = Math.abs(deltaX) / distanceThresholdX
+        if (deltaX > 0) {
+          if (percent > 1) {
+            appActions.swipedLeft(1)
+            deltaX = distanceThresholdX
+          } else {
+            appActions.swipedLeft(percent)
+          }
+        } else {
+          if (percent > 1) {
+            appActions.swipedRight(1)
+            deltaX = -distanceThresholdX
+          } else {
+            appActions.swipedRight(percent)
+          }
         }
       }
     })
@@ -343,7 +320,7 @@ class Main extends React.Component {
     // If the tab changes or was closed, exit out of full screen to give a better
     // picture of what's happening.
     if (prevProps.tabId !== this.props.tabId && this.props.isFullScreen) {
-      windowActions.setFullScreen(this.props.tabId, false)
+      appActions.tabSetFullScreen(this.props.tabId, false)
     }
   }
 
@@ -419,10 +396,6 @@ class Main extends React.Component {
 
     ipc.on(messages.HTTPSE_RULE_APPLIED, (e, ruleset, details) => {
       windowActions.setRedirectedBy(details.tabId, ruleset, details.url)
-    })
-
-    ipc.on(messages.CERT_ERROR, (e, details) => {
-      windowActions.onCertError(details.tabId, details.url, details.error)
     })
 
     ipc.on(messages.SET_SECURITY_STATE, (e, tabId, securityState) => {
@@ -540,16 +513,25 @@ class Main extends React.Component {
     const widevinePanelDetail = currentWindow.get('widevinePanelDetail', Immutable.Map())
     const loginRequiredDetails = basicAuthState.getLoginRequiredDetail(state, activeTabId)
     const focused = isFocused(state)
+    const isTor = frameStateUtil.isTor(activeFrame)
+    const torConnectionError = state.getIn(['tor', 'error'])
 
     const props = {}
     // used in renderer
+    props.activeFrameKey = activeFrame.get('key')
+    if (window.activeFrameKey !== props.activeFrameKey) {
+      window.activeFrameKey = props.activeFrameKey
+    }
+    props.previewFrameKey = frameStateUtil.getPreviewFrameKey(currentWindow)
     props.isFullScreen = activeFrame.get('isFullScreen', false)
+    props.showFullScreenWarning = activeFrame.get('showFullScreenWarning')
     props.isMaximized = isMaximized(state) || isFullScreen(state)
     props.captionButtonsVisible = isWindows
     props.showContextMenu = currentWindow.has('contextMenuDetail')
     props.showPopupWindow = currentWindow.has('popupWindowDetail')
-    props.showSiteInfo = currentWindow.getIn(['ui', 'siteInfo', 'isVisible']) &&
-      !isSourceAboutUrl(activeFrame.get('location'))
+    props.showSiteInfo = (currentWindow.getIn(['ui', 'siteInfo', 'isVisible']) &&
+      !isSourceAboutUrl(activeFrame.get('location'))) ||
+      (torConnectionError && isTor)
     props.showBravery = shieldState.braveShieldsEnabled(activeFrame) &&
       !!currentWindow.get('braveryPanelDetail')
     props.showClearData = currentWindow.getIn(['ui', 'isClearBrowsingDataPanelVisible'], false)
@@ -565,7 +547,6 @@ class Main extends React.Component {
       urlUtil.getOrigin(activeFrame.get('location'))
     props.showReleaseNotes = currentWindow.getIn(['ui', 'releaseNotes', 'isVisible'])
     props.showCheckDefault = focused && defaultBrowserState.shouldDisplayDialog(state)
-    props.showUpdate = updateState.isUpdateVisible(state)
     props.showBookmarksToolbar = getSetting(settings.SHOW_BOOKMARKS_TOOLBAR)
     props.shouldAllowWindowDrag = windowState.shouldAllowWindowDrag(state, currentWindow, activeFrame, focused)
     props.isSinglePage = nonPinnedFrames.size <= tabsPerPage
@@ -573,7 +554,6 @@ class Main extends React.Component {
     props.showNotificationBar = activeOrigin && state.get('notifications').filter((item) =>
         item.get('frameOrigin') ? activeOrigin === item.get('frameOrigin') : true).size > 0
     props.showFindBar = activeFrame.get('findbarShown') && !activeFrame.get('isFullScreen')
-    props.sortedFrames = frameStateUtil.getSortedFrameKeys(currentWindow)
     props.showDownloadBar = currentWindow.getIn(['ui', 'downloadsToolbar', 'isVisible']) &&
       state.get('downloads') && state.get('downloads').size > 0
     props.title = activeFrame.get('title')
@@ -581,6 +561,9 @@ class Main extends React.Component {
     props.loginRequiredUrl = loginRequiredDetails
       ? urlResolve(loginRequiredDetails.getIn(['request', 'url']), '/')
       : null
+    props.showMessageBox = tabMessageBoxState.hasMessageBoxDetail(state, activeTabId)
+    props.daysUntilObsolete = obsoletionStateHelper.getDaysUntilObsolete(state)
+    props.isBraveCoreInstalled = !!state.hasIn(['about', 'init', 'braveCoreVersion'])
 
     // used in other functions
     props.menubarSelectedIndex = currentWindow.getIn(['ui', 'menubar', 'selectedIndex'])
@@ -593,8 +576,44 @@ class Main extends React.Component {
     props.isWidevineReady = state.getIn([appConfig.resourceNames.WIDEVINE, 'ready'])
     props.widevineLocation = urlUtil.getOrigin(widevinePanelDetail.get('location'))
     props.widevineRememberSettings = widevinePanelDetail.get('alsoAddRememberSiteSetting') ? 1 : 0
+    props.arch = state.getIn(['about', 'brave', 'arch']) || ''
 
     return props
+  }
+
+  onDeprecationButtonClick = () => {
+    if (!this.props.isBraveCoreInstalled) {
+      appActions.createTabRequested({
+        url: 'https://brave.com/download'
+      })
+    } else {
+      appActions.launchBraveCore()
+    }
+  }
+
+  getDeprecationBannerMessageText () {
+    const prefix = 'This version of Brave is unsupported and'
+    if (this.props.daysUntilObsolete === 0) {
+      return `${prefix} can no longer be used.`
+    }
+    return `${prefix} can only be used for ${this.props.daysUntilObsolete} more day${this.props.daysUntilObsolete > 1 ? 's' : ''}.`
+  }
+
+  renderDeprecationBanner () {
+    return <div className={css(styles.deprecationBanner)}>
+      <p className={css(styles.deprecationBanner_Message)}>
+        <span className={css(styles.deprecationBanner_Message_Greeting)}>Hello! </span>
+        { this.getDeprecationBannerMessageText() }
+        { this.props.isBraveCoreInstalled ? ' Start using the' : ' Upgrade to the' } new Brave as soon as possible.
+      </p>
+      <div className={css(styles.deprecationBanner_Action)}>
+        <BrowserButton
+          primaryColor
+          l10nId={this.props.isBraveCoreInstalled ? 'Launch the new Brave' : 'Download the new Brave'}
+          onClick={this.onDeprecationButtonClick}
+        />
+      </div>
+    </div>
   }
 
   render () {
@@ -695,13 +714,9 @@ class Main extends React.Component {
             ? <CheckDefaultBrowserDialog />
             : null
         }
+        { this.renderDeprecationBanner() }
         {
           <BraveNotificationBar />
-        }
-        {
-          this.props.showUpdate
-          ? <UpdateBar />
-          : null
         }
         {
           this.props.showBookmarksToolbar
@@ -735,28 +750,23 @@ class Main extends React.Component {
           : null
         }
       </div>
-      <div className='mainContainer'>
-        <TransitionGroup className='tabContainer'>
-          {
-            this.props.sortedFrames.map((frameKey) =>
-              <Transition
-                key={frameKey}
-                // after how long (ms)
-                // should the state 'entering' switch to 'entered'
-                // and also how long should state switch from 'exiting'
-                // to the <Frame /> component actually being removed
-                timeout={150}>
-                {
-                  (transitionState) =>
-                    <Frame
-                      frameKey={frameKey}
-                      transitionState={transitionState}
-                    />
-                }
-              </Transition>
-            )
-          }
-        </TransitionGroup>
+      <div className={cx({
+        mainContainer: true,
+        hasFramePreview: this.props.previewFrameKey != null
+      })}>
+        {
+          this.props.isFullScreen && this.props.showFullScreenWarning
+          ? <FullScreenWarning location={this.props.location} />
+          : null
+        }
+        <GuestInstanceRenderer isPreview={!!this.props.previewFrameKey} frameKey={this.props.previewFrameKey != null ? this.props.previewFrameKey : this.props.activeFrameKey} />
+        <HrefPreview frameKey={this.props.activeFrameKey} />
+        {
+          this.props.showMessageBox
+          ? <MessageBox
+            tabId={this.props.tabId} />
+          : null
+        }
       </div>
       {
         this.props.showDownloadBar
@@ -780,6 +790,32 @@ const styles = StyleSheet.create({
 
   tabPagesWrap_allowDragging: {
     WebkitAppRegion: 'drag'
+  },
+
+  deprecationBanner: {
+    backgroundColor: 'white',
+    display: 'flex',
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    padding: '8px 20px'
+  },
+
+  deprecationBanner_Message: {
+    color: globalStyles.color.commonTextColor,
+    fontSize: '15px',
+    cursor: 'default',
+    userSelect: 'none'
+  },
+
+  deprecationBanner_Message_Greeting: {
+    color: globalStyles.color.braveOrange,
+    fontSize: '16px'
+  },
+
+  deprecationBanner_Action: {
+    minWidth: '178px',
+    marginLeft: '10px'
   }
 })
 

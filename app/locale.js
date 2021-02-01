@@ -46,6 +46,8 @@ var rendererIdentifiers = function () {
     'openInNewSessionTabs',
     'openInNewPrivateTab',
     'openInNewPrivateTabs',
+    'openInNewTorTab',
+    'openInNewTorTabs',
     'openInNewTab',
     'openInNewTabs',
     'openAllInTabs',
@@ -66,6 +68,8 @@ var rendererIdentifiers = function () {
     'ledgerBackupText3',
     'ledgerBackupText4',
     'ledgerBackupText5',
+    'backupKeys',
+    'backupKeysNow',
     'editFolder',
     'editBookmark',
     'unmuteTabs',
@@ -151,6 +155,7 @@ var rendererIdentifiers = function () {
     'hideOthers',
     'showAll',
     'newPrivateTab',
+    'newTorTab',
     'newSessionTab',
     'newWindow',
     'reopenLastClosedTab',
@@ -177,6 +182,7 @@ var rendererIdentifiers = function () {
     'forgetLearnedSpelling',
     'lookupSelection',
     'publisherMediaName',
+    'addToPublisherList',
     // Other identifiers
     'aboutBlankTitle',
     'urlCopied',
@@ -210,6 +216,10 @@ var rendererIdentifiers = function () {
     'smartphoneTitle',
     'updateLater',
     'updateHello',
+    'urlbarPlaceholder',
+    'urlbarPlaceholderTorSuccess',
+    'urlbarPlaceholderTorProgress',
+    'torConnectionError',
     // notifications
     'notificationPasswordWithUserName',
     'notificationUpdatePasswordWithUserName',
@@ -226,13 +236,13 @@ var rendererIdentifiers = function () {
     'no',
     'noThanks',
     'neverForThisSite',
-    'walletConvertedBackup',
-    'walletConvertedDismiss',
-    'walletConvertedLearnMore',
-    'walletConvertedToBat',
     'dappDetected',
     'dappDismiss',
     'dappEnableExtension',
+    'banSiteConfirmation',
+    'paymentsDeleteWalletConfirmation',
+    'messageBoxOk',
+    'messageBoxCancel',
     // other
     'passwordsManager',
     'extensionsManager',
@@ -256,6 +266,10 @@ var rendererIdentifiers = function () {
     'downloadPaused',
     'noDownloads',
     'torrentDesc',
+    'urlBlockedInTor',
+    'urlBlockedOutsideTor',
+    'urlWarningOk',
+    'multiSelectionBookmarks',
     // Caption buttons in titlebar (min/max/close - Windows only)
     'windowCaptionButtonMinimize',
     'windowCaptionButtonMaximize',
@@ -282,7 +296,15 @@ var rendererIdentifiers = function () {
     'promotionGeneralErrorText',
     'promotionClaimedErrorMessage',
     'promotionClaimedErrorText',
-    'promotionClaimedErrorTitle'
+    'promotionClaimedErrorTitle',
+    'promotionCaptchaBlockTitle',
+    'promotionCaptchaBlockMessage',
+    'corruptedOverlayTitle',
+    'corruptedOverlayMessage',
+    'corruptedOverlayText',
+    'ledgerNetworkErrorTitle',
+    'ledgerNetworkErrorMessage',
+    'ledgerNetworkErrorText'
   ].concat(countryCodes).concat(availableLanguages)
 }
 
@@ -298,7 +320,13 @@ exports.translation = function (token, replacements = {}) {
   } else {
     // This will return an identifier in upper case useful for determining if a translation was not requested in the menu
     // identifiers above.
-    return token.toUpperCase()
+
+    let replacementText = ''
+    Object.keys(replacements).forEach(key => {
+      replacementText += `, ${key}/${replacements[key]}`
+    })
+
+    return token.toUpperCase() + replacementText
   }
 }
 
@@ -355,24 +383,19 @@ availableLanguages.forEach(function (lang) {
 })
 
 // Return the default locale in xx-XX format I.e. pt-BR
-const defaultLocale = function () {
-  // If electron has the locale
+module.exports.getDefaultLocale = function (allowUnsupported = false) {
   if (app.getLocale()) {
-    // Retrieve the language and convert _ to -
     var lang = app.getLocale().replace('_', '-')
     // If there is no country code designated use the language code
     if (!lang.match(/-/)) {
       lang = lang + '-' + lang.toUpperCase()
     }
     // If we have the language configured
-    if (configuredLanguages[lang]) {
+    if (allowUnsupported || configuredLanguages[lang]) {
       return lang
-    } else {
-      return DEFAULT_LANGUAGE
     }
-  } else {
-    return DEFAULT_LANGUAGE
   }
+  return DEFAULT_LANGUAGE
 }
 
 // Initialize translations for a language
@@ -396,7 +419,7 @@ exports.init = function (language) {
   }
 
   // Currently selected language identifier I.e. 'en-US'
-  lang = language || defaultLocale()
+  lang = language || module.exports.getDefaultLocale()
 
   // Languages to support
   const langs = availableLanguages.map(function (lang) {
@@ -415,7 +438,8 @@ exports.init = function (language) {
       path.join(__dirname, 'extensions', 'brave', 'locales', lang, 'countries.properties'),
       path.join(__dirname, 'extensions', 'brave', 'locales', lang, 'locales.properties'),
       path.join(__dirname, 'extensions', 'brave', 'locales', lang, 'preferences.properties'),
-      path.join(__dirname, 'extensions', 'brave', 'locales', lang, 'downloads.properties')
+      path.join(__dirname, 'extensions', 'brave', 'locales', lang, 'downloads.properties'),
+      path.join(__dirname, 'extensions', 'brave', 'locales', lang, 'bookmarks.properties')
       )
   }
 

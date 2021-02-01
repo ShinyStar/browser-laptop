@@ -12,6 +12,7 @@ const updater = require('./updater')
 const appConfig = require('../js/constants/appConfig')
 const async = require('async')
 const messages = require('../js/constants/messages')
+const settings = require('../js/constants/settings')
 const appActions = require('../js/actions/appActions')
 const platformUtil = require('./common/lib/platformUtil')
 const Immutable = require('immutable')
@@ -112,14 +113,18 @@ const saveAppState = (forceSave = false) => {
           }
         }
 
-        // If there's an update to apply, then do it here.
-        // Otherwise just quit.
-        if (immutableAppState.get('updates') && (immutableAppState.getIn(['updates', 'status']) === updateStatus.UPDATE_APPLYING_NO_RESTART ||
-            immutableAppState.getIn(['updates', 'status']) === updateStatus.UPDATE_APPLYING_RESTART)) {
-          updater.quitAndInstall()
-        } else {
-          app.quit()
-        }
+        // Workaround potential race condition in #14667
+        const quitTimeout = platformUtil.isLinux() && immutableAppState.getIn(['settings', settings.SHUTDOWN_CLEAR_HISTORY]) ? 1000 : 0
+        setTimeout(() => {
+          // If there's an update to apply, then do it here.
+          // Otherwise just quit.
+          if (immutableAppState.get('updates') && (immutableAppState.getIn(['updates', 'status']) === updateStatus.UPDATE_APPLYING_NO_RESTART ||
+              immutableAppState.getIn(['updates', 'status']) === updateStatus.UPDATE_APPLYING_RESTART)) {
+            updater.quitAndInstall()
+          } else {
+            app.quit()
+          }
+        }, quitTimeout)
       } else {
         const cb = sessionStateStoreCompleteCallback
         sessionStateStoreCompleteCallback = null
@@ -218,7 +223,10 @@ ipcMain.on(messages.RESPONSE_WINDOW_STATE, (evt, mem) => {
 })
 
 ipcMain.on(messages.LAST_WINDOW_STATE, (evt, data) => {
-  if (data) {
+  // Remember last window (that was not buffer window, i.e. had frames).
+  // When the last tab of a window closes, the window is closed before the tab closes, so
+  // a used closing window will almost always have at least 1 frame.
+  if (data && data.frames && data.frames.length) {
     immutableLastWindowClosedState = Immutable.fromJS(data)
   }
 })

@@ -9,12 +9,14 @@ const {DragDropContext} = require('react-dnd')
 const HTML5Backend = require('react-dnd-html5-backend')
 
 // Components
+const BrowserObsoletePage = require('./browserObsoletePage')
 const Stats = require('./newTabComponents/stats')
 const Clock = require('./newTabComponents/clock')
 const Block = require('./newTabComponents/block')
 const SiteRemovalNotification = require('./newTabComponents/siteRemovalNotification')
 const FooterInfo = require('./newTabComponents/footerInfo')
 const NewPrivateTab = require('./newprivatetab')
+const BrowserButton = require('../../app/renderer/components/common/browserButton')
 
 // Constants
 const messages = require('../constants/messages')
@@ -29,7 +31,7 @@ const backgrounds = require('../data/backgrounds')
 
 // Utils
 const urlutils = require('../lib/urlutil')
-const {random} = require('../../app/common/lib/randomUtil')
+const random = require('../../app/common/lib/randomUtil')
 const cx = require('../lib/classSet')
 const ipc = window.chrome.ipcRenderer
 
@@ -48,7 +50,9 @@ class NewTabPage extends React.Component {
       updatedStamp: undefined,
       showEmptyPage: true,
       showImages: false,
-      backgroundImage: undefined
+      torEnabled: false,
+      backgroundImage: undefined,
+      isObsolete: false
     }
 
     ipc.on(messages.NEWTAB_DATA_UPDATED, (e, newData) => {
@@ -64,14 +68,19 @@ class NewTabPage extends React.Component {
 
       const showEmptyPage = !!data.get('showEmptyPage')
       const showImages = !!data.get('showImages') && !showEmptyPage
+      const versionInformation = data.get('versionInformation')
       this.setState({
         newTabData: data,
         updatedStamp,
         showEmptyPage,
+        torEnabled: data.get('torEnabled'),
         showImages: !!data.get('showImages') && !showEmptyPage,
         backgroundImage: showImages
           ? this.state.backgroundImage || this.randomBackgroundImage
-          : undefined
+          : undefined,
+        versionInformation,
+        braveCoreInstalled: (versionInformation && versionInformation.getIn(['initState', 'braveCoreInstalled'])) || false,
+        isObsolete: data.get('isObsolete')
       })
     })
   }
@@ -81,7 +90,7 @@ class NewTabPage extends React.Component {
   }
 
   get randomBackgroundImage () {
-    const image = Object.assign({}, backgrounds[Math.floor(random() * backgrounds.length)])
+    const image = Object.assign({}, backgrounds[random.uniform(backgrounds.length)])
     return image
   }
 
@@ -255,14 +264,119 @@ class NewTabPage extends React.Component {
     return name.charAt(0).toUpperCase()
   }
 
+  launchBraveCore () {
+    const braveCoreInstallPath = this.state.versionInformation && this.state.versionInformation.getIn(['initState', 'braveCoreInstallPath'])
+    if (braveCoreInstallPath) {
+      aboutActions.launchBraveCore()
+    }
+  }
+
+  onObsoleteAction = () => {
+    if (this.state.braveCoreInstalled) {
+      this.launchBraveCore()
+    } else {
+      document.location = 'https://brave.com/download'
+    }
+  }
+
+  openHelp () {
+    window.location = 'https://support.brave.com/hc/en-us/articles/360018538092'
+  }
+
+  getDeprecatedText () {
+    const muonVersion = this.state.versionInformation && this.state.versionInformation.get('browserLaptop')
+    const formattedMuonVersion = muonVersion
+      ? ('(' + muonVersion + ')')
+      : ''
+    const braveCoreVersion = this.state.braveCoreInstalled && this.state.versionInformation && this.state.versionInformation.getIn(['initState', 'braveCoreVersion'])
+
+    if (this.state.braveCoreInstalled) {
+      return <div className='deprecationNotice'>
+        <div>
+          <span className='note'>Your new Brave Browser is already installed!</span>
+        </div>
+        <div style={{marginTop: '20px'}}>
+          Experience an updated toolbar layout, full Chrome extension
+          support, and contribute to your favorite content creators with
+          Brave Rewards (previously Brave Payments).
+        </div>
+        <div style={{marginTop: '20px'}}>
+          <span className='note'>Please note:</span> Your current version
+          of Brave {formattedMuonVersion} will no longer be supported. To
+          avoid security risks, migrate to the new Brave as soon as possible.
+        </div>
+        <div style={{marginTop: '40px'}}>
+          <span style={{width: '50%', textAlign: 'center', display: 'inline-block'}}>
+            <a onClick={aboutActions.createTabRequested.bind(null, {
+              url: 'https://support.brave.com/hc/en-us/articles/360018538092'
+            })}>Learn more…</a>
+          </span>
+          <div style={{width: '50%', display: 'inline-block'}}>
+            <div style={{marginBottom: '10px', textAlign: 'center'}} className='note'>
+              Installed version: {braveCoreVersion}
+            </div>
+            <BrowserButton
+              primaryColor
+              l10nId='Launch the new Brave'
+              inlineStyles={{width: '100%'}}
+              onClick={this.launchBraveCore.bind(this)}
+            />
+          </div>
+        </div>
+      </div>
+    }
+
+    return <div className='deprecationNotice'>
+      <div>
+        <span className='note'>The new Brave Browser has arrived!</span>
+      </div>
+      <div style={{marginTop: '20px'}}>
+        Experience an updated toolbar layout, full Chrome extension
+        support, and contribute to your favorite content creators with
+        Brave Rewards (previously Brave Payments).
+      </div>
+      <div style={{marginTop: '20px'}}>
+        <span className='note'>Please note:</span> Your current version
+        of Brave {formattedMuonVersion} will no longer be supported. To
+        avoid security risks, migrate to the new Brave as soon as possible.
+      </div>
+      <div style={{marginTop: '40px'}}>
+        <span style={{width: '50%', textAlign: 'center', display: 'inline-block'}}>
+          <a onClick={aboutActions.createTabRequested.bind(null, {
+            url: 'https://support.brave.com/hc/en-us/articles/360018538092'
+          })}>Learn more…</a>
+        </span>
+        <BrowserButton
+          primaryColor
+          l10nId='Download the new Brave'
+          inlineStyles={{width: '50%'}}
+          onClick={aboutActions.createTabRequested.bind(null, {
+            url: 'https://brave.com/download'
+          })}
+        />
+      </div>
+    </div>
+  }
+
   render () {
+    if (this.state.isObsolete) {
+      const obsoleteActionText = this.state.braveCoreInstalled
+                  ? 'Launch the new Brave'
+                  : 'Download the new Brave'
+      return <BrowserObsoletePage
+        onObsoleteActionClick={this.onObsoleteAction}
+        obsoleteActionText={obsoleteActionText}
+      />
+    }
+
     // don't render if user prefers an empty page
     if (this.state.showEmptyPage && !this.props.isIncognito) {
       return <div className='empty' />
     }
 
+    // TODO: use this.props.isIncognito when muon supports it for tor tabs
     if (this.props.isIncognito) {
-      return <NewPrivateTab newTabData={this.state.newTabData} />
+      return <NewPrivateTab newTabData={this.state.newTabData} torEnabled={this.state.torEnabled} />
     }
 
     // don't render until object is found
@@ -327,6 +441,10 @@ class NewTabPage extends React.Component {
                 })
               }
             </nav>
+
+            <div>
+              { this.getDeprecatedText() }
+            </div>
           </div>
         </main>
         {

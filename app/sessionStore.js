@@ -19,16 +19,21 @@ const Immutable = require('immutable')
 const app = electron.app
 const compareVersions = require('compare-versions')
 const merge = require('deepmerge')
+const {execSync} = require('child_process')
 
 // Constants
 const UpdateStatus = require('../js/constants/updateStatus')
 const settings = require('../js/constants/settings')
 const siteTags = require('../js/constants/siteTags')
+const config = require('../js/constants/config')
 const downloadStates = require('../js/constants/downloadStates')
+const ledgerStatuses = require('./common/constants/ledgerStatuses')
+const promotionStatuses = require('./common/constants/promotionStatuses')
 
 // State
 const tabState = require('./common/state/tabState')
 const windowState = require('./common/state/windowState')
+const ledgerState = require('./common/state/ledgerState')
 
 // Utils
 const locale = require('./locale')
@@ -39,10 +44,11 @@ const {navigatableTypes} = require('../js/lib/appUrlUtil')
 const {isDataUrl, parseFaviconDataUrl} = require('../js/lib/urlutil')
 const Channel = require('./channel')
 const BuildConfig = require('./buildConfig')
-const {isImmutable, isMap, makeImmutable, deleteImmutablePaths} = require('./common/state/immutableUtil')
+const {isImmutable, makeImmutable, deleteImmutablePaths} = require('./common/state/immutableUtil')
 const {getSetting} = require('../js/settings')
 const platformUtil = require('./common/lib/platformUtil')
 const historyUtil = require('./common/lib/historyUtil')
+const {newTabMode} = require('./common/constants/settingsEnums')
 
 const sessionStorageVersion = 1
 const sessionStorageName = `session-store-${sessionStorageVersion}`
@@ -78,7 +84,10 @@ module.exports.saveAppState = (immutablePayload, isShutdown) => {
     if (immutablePayload.get('perWindowState')) {
       if (savePerWindowState) {
         immutablePayload.get('perWindowState').forEach((immutableWndPayload, i) => {
-          const frames = immutableWndPayload.get('frames').filter((frame) => !frame.get('isPrivate'))
+          let frames = immutableWndPayload.get('frames')
+          if (frames) {
+            frames = frames.filter((frame) => !frame.get('isPrivate'))
+          }
           immutableWndPayload = immutableWndPayload.set('frames', frames)
           immutablePayload = immutablePayload.setIn(['perWindowState', i], immutableWndPayload)
         })
@@ -228,10 +237,7 @@ module.exports.cleanPerWindowData = (immutablePerWindowData, isShutdown) => {
       // currently get re-generated when session store is
       // restored.  We will be able to keep this once we
       // don't regenerate new frame keys when opening storage.
-      'parentFrameKey',
-      // Delete the active shortcut details
-      'activeShortcut',
-      'activeShortcutDetails'
+      'parentFrameKey'
     ])
 
     if (immutableFrame.get('navbar') && immutableFrame.getIn(['navbar', 'urlbar'])) {
@@ -243,6 +249,7 @@ module.exports.cleanPerWindowData = (immutablePerWindowData, isShutdown) => {
     }
     return immutableFrame
   }
+
   const clearHistory = isShutdown && getSetting(settings.SHUTDOWN_CLEAR_HISTORY) === true
   if (clearHistory) {
     immutablePerWindowData = immutablePerWindowData.set('closedFrames', Immutable.List())
@@ -294,6 +301,8 @@ module.exports.cleanAppData = (immutableData, isShutdown) => {
   immutableData = immutableData.set('notifications', Immutable.List())
   // Delete temp site settings
   immutableData = immutableData.set('temporarySiteSettings', Immutable.Map())
+  // Delete Tor init state
+  immutableData = immutableData.set('tor', Immutable.Map())
 
   if (immutableData.getIn(['settings', settings.CHECK_DEFAULT_ON_STARTUP]) === true) {
     // Delete defaultBrowserCheckComplete state since this is checked on startup
@@ -304,12 +313,18 @@ module.exports.cleanAppData = (immutableData, isShutdown) => {
     immutableData = immutableData.deleteIn(['ui', 'about', 'preferences', 'recoverySucceeded'])
   } catch (e) {}
 
-  const perWindowStateList = immutableData.get('perWindowState')
+  let perWindowStateList = immutableData.get('perWindowState')
   if (perWindowStateList) {
-    perWindowStateList.forEach((immutablePerWindowState, i) => {
-      const cleanedImmutablePerWindowState = module.exports.cleanPerWindowData(immutablePerWindowState, isShutdown)
-      immutableData = immutableData.setIn(['perWindowState', i], cleanedImmutablePerWindowState)
-    })
+    // Clean window state (e.g. remove private tabs and UI state)
+    perWindowStateList = perWindowStateList.map(
+      (immutablePerWindowState) => module.exports.cleanPerWindowData(immutablePerWindowState, isShutdown)
+    )
+    // Do not save window state if it has no tabs,
+    // e.g. if the only tabs were private tabs, or the window was a buffer window.
+    perWindowStateList = perWindowStateList.filter(
+      (immutablePerWindowState) => immutablePerWindowState.hasIn(['frames', 0])
+    )
+    immutableData = immutableData.set('perWindowState', perWindowStateList)
   }
   const clearAutocompleteData = isShutdown && getSetting(settings.SHUTDOWN_CLEAR_AUTOCOMPLETE_DATA) === true
   if (clearAutocompleteData) {
@@ -319,6 +334,13 @@ module.exports.cleanAppData = (immutableData, isShutdown) => {
       console.error('cleanAppData: error calling autofill.clearAutocompleteData: ', e)
     }
   }
+
+  const clearSynopsis = isShutdown && getSetting(settings.SHUTDOWN_CLEAR_PUBLISHERS) === true
+  const inProgress = ledgerState.getAboutProp(immutableData, 'status') === ledgerStatuses.IN_PROGRESS
+  if (clearSynopsis && immutableData.has('ledger') && !inProgress) {
+    immutableData = ledgerState.resetPublishers(immutableData)
+  }
+
   const clearAutofillData = isShutdown && getSetting(settings.SHUTDOWN_CLEAR_AUTOFILL_DATA) === true
   if (clearAutofillData) {
     autofill.clearAutofillData()
@@ -396,6 +418,17 @@ module.exports.cleanAppData = (immutableData, isShutdown) => {
     }
   }
 
+  if (isShutdown) {
+    const status = ledgerState.getPromotionProp(immutableData, 'promotionStatus')
+    if (
+      status === promotionStatuses.CAPTCHA_CHECK ||
+      status === promotionStatuses.CAPTCHA_BLOCK ||
+      status === promotionStatuses.CAPTCHA_ERROR
+    ) {
+      immutableData = ledgerState.setPromotionProp(immutableData, 'promotionStatus', null)
+    }
+  }
+
   immutableData = immutableData.delete('menu')
   immutableData = immutableData.delete('pageData')
 
@@ -428,18 +461,6 @@ module.exports.cleanAppData = (immutableData, isShutdown) => {
     immutableData = immutableData.deleteIn(['ledger', 'locations'])
   }
 
-  // Remove windowState from perWindowState if there are no frames
-  // ex: if window only had a single private tab, let's remove it (they aren't saved)
-  if (perWindowStateList) {
-    perWindowStateList.forEach((immutablePerWindowState, i) => {
-      if (isMap(immutablePerWindowState) && immutablePerWindowState.has('frames')) {
-        if (!immutablePerWindowState.get('frames').size) {
-          immutableData = immutableData.deleteIn(['perWindowState', i])
-        }
-      }
-    })
-  }
-
   try {
     // Prune data: favicons by moving them to external files
     const basePath = getStoragePath('ledger-favicons')
@@ -453,6 +474,11 @@ module.exports.cleanAppData = (immutableData, isShutdown) => {
     immutableData = cleanFavicons(basePath, immutableData)
   } catch (e) {
     console.error('cleanAppData: error cleaning up data: urls', e)
+  }
+
+  // delete the window ready state (gets set again on program start)
+  if (immutableData.has('windowReady')) {
+    immutableData = immutableData.delete('windowReady')
   }
 
   return immutableData
@@ -561,6 +587,7 @@ const setVersionInformation = (immutableData) => {
     immutableData = immutableData.set('about', Immutable.Map())
   }
   immutableData = immutableData.setIn(['about', 'brave', 'versionInformation'], Immutable.fromJS(versionInformation))
+  immutableData = immutableData.setIn(['about', 'brave', 'arch'], os.arch())
   return immutableData
 }
 
@@ -667,6 +694,10 @@ module.exports.runPreMigrations = (data) => {
       data.settings[settings.PAYMENTS_NOTIFICATION_TRY_PAYMENTS_DISMISSED] = data.settings['payments.notificationTryPaymentsDismissed']
       delete data.settings['payments.notificationTryPaymentsDismissed']
     }
+
+    // force NEWTAB_MODE to be dashboard so folks can see deprecation notice
+    // preference is also disabled (see js/about/preferences.js)
+    data.settings[settings.NEWTAB_MODE] = newTabMode.NEW_TAB_PAGE
   }
 
   if (data.sites) {
@@ -824,11 +855,61 @@ module.exports.runPreMigrations = (data) => {
     delete data.sites
   }
 
-  if (data.lastAppVersion) {
+  if (data.lastAppVersion || data.quarantineNeeded) {
+    // with version 0.22.13, any file downloaded (including the update itself) would get
+    // quarantined on macOS (per work done with https://github.com/brave/muon/pull/484)
+    // this functionality was then reverted with https://github.com/brave/muon/pull/570
+    //
+    // To fix the executable, we need to manually un-quarantine the Brave executable so that it works as expected
+    if (process.platform === 'darwin' && (compareVersions(data.lastAppVersion, '0.22.13') === 0 || data.quarantineNeeded)) {
+      const unQuarantine = (appPath) => {
+        try {
+          execSync(`xattr -d com.apple.quarantine "${appPath}" || true`)
+          console.log(`Quarantine attribute has been removed from ${appPath}`)
+        } catch (e) {
+          console.error(`Failed to remove quarantine attribute from ${appPath}: `, e)
+        }
+      }
+
+      console.log('Update was downloaded from 0.22.13' + data.quarantineNeeded ? ' (first launch after auto-update)' : '')
+
+      // Un-quarantine default path
+      const defaultAppPath = '/Applications/Brave.app'
+      unQuarantine(defaultAppPath)
+
+      // Un-quarantine custom path
+      const appPath = app.getPath('exe')
+      const appIndex = appPath.indexOf('.app') + '.app'.length
+      if (appPath && appIndex > 4) {
+        // Remove the `Contents`/`MacOS`/`Brave` parts from path
+        const runningAppPath = appPath.substring(0, appIndex)
+        if (runningAppPath.startsWith('/private/var/folders')) {
+          // This is true when Squirrel re-launches Brave after an auto-update
+          // File system is read-only; the xattr command would fail
+          data.quarantineNeeded = true
+        } else if (runningAppPath !== defaultAppPath) {
+          // Path is the installed location
+          unQuarantine(runningAppPath)
+          data.quarantineNeeded = false
+        }
+      }
+    }
+
+    let runHSTSCleanup = false
+    try { runHSTSCleanup = compareVersions(data.lastAppVersion, '0.22.13') < 1 } catch (e) {}
+
+    if (runHSTSCleanup) {
+      filtering.clearHSTSData()
+    }
+
     // Force WidevineCdm to be upgraded when last app version <= 0.18.25
     let runWidevineCleanup = false
+    let formatPublishers = false
 
-    try { runWidevineCleanup = compareVersions(data.lastAppVersion, '0.18.25') < 1 } catch (e) {}
+    try {
+      runWidevineCleanup = compareVersions(data.lastAppVersion, '0.18.25') < 1
+      formatPublishers = compareVersions(data.lastAppVersion, '0.22.3') < 1
+    } catch (e) {}
 
     if (runWidevineCleanup) {
       const fs = require('fs-extra')
@@ -840,6 +921,23 @@ module.exports.runPreMigrations = (data) => {
       })
     }
 
+    if (formatPublishers) {
+      const publishers = data.ledger.synopsis.publishers
+
+      if (publishers && Object.keys(publishers).length > 0) {
+        Object.entries(publishers).forEach((item) => {
+          const publisherKey = item[0]
+          const publisher = item[1]
+          const siteKey = `https?://${publisherKey}`
+          if (data.siteSettings[siteKey] == null || publisher.faviconName == null) {
+            return
+          }
+
+          data.siteSettings[siteKey].siteName = publisher.faviconName
+        })
+      }
+    }
+
     // Bookmark cache was generated wrongly on and before 0.20.25 from 0.19.x upgrades
     let runCacheClean = false
     try { runCacheClean = compareVersions(data.lastAppVersion, '0.20.25') < 1 } catch (e) {}
@@ -847,11 +945,17 @@ module.exports.runPreMigrations = (data) => {
       if (data.cache) {
         delete data.cache.bookmarkLocation
       }
+    }
 
-      // pinned top sites were stored in the wrong position in 0.19.x
-      // allowing duplicated items. See #12941
-      // in this case eliminate pinned items so they can be properly
-      // populated in their own indexes
+    // pinned top sites were stored in the wrong position in 0.19.x
+    // and on some updates ranging from 0.20.x/0.21.x
+    // allowing duplicated items. See #12941
+    let pinnedTopSitesCleanup = false
+    try {
+      pinnedTopSitesCleanup = compareVersions(data.lastAppVersion, '0.22.00') < 1
+    } catch (e) {}
+
+    if (pinnedTopSitesCleanup) {
       if (data.about.newtab.pinnedTopSites) {
         // Empty array is currently set to include default pinned sites
         // which we avoid given the user already have a profile
@@ -859,6 +963,11 @@ module.exports.runPreMigrations = (data) => {
       }
     }
   }
+
+  // TODO: consider moving all of the above logic into here
+  // see https://github.com/brave/browser-laptop/issues/10488
+  const runMigrations = require('./migrations/pre')
+  runMigrations(data)
 
   return data
 }
@@ -911,6 +1020,47 @@ module.exports.runImportDefaultSettings = (data) => {
   }
 
   return data
+}
+
+const getCanonicalCountryName = () => {
+  const countryName = (app.getCountryName() || '').replace(/\0/g, '')
+  switch (countryName) {
+    case 'US':
+    case 'Vereinigte Staaten':
+    case 'en_US.UTF-8':
+    case 'es_US.UTF-8':
+      return 'USA'
+
+    case 'France':
+    case 'Frankreich':
+    case 'FR':
+    case 'fr_FR.UTF-8':
+      return 'France'
+
+    case 'Germany':
+    case 'Deutschland':
+    case 'Allemagne':
+    case 'DE':
+    case 'de_DE.UTF-8':
+      return 'Germany'
+  }
+  return countryName
+}
+
+module.exports.setDefaultSearchEngine = (immutableData) => {
+  let defaultSearchEngine = config.defaultSearchEngineByCountry.default
+  const countryName = getCanonicalCountryName()
+  const countrySpecificEntry = countryName && config.defaultSearchEngineByCountry[countryName]
+
+  if (countrySpecificEntry) {
+    defaultSearchEngine = countrySpecificEntry
+    // don't promote private tab engine override if region specific default search engine is set
+    immutableData = immutableData.setIn(['settings', settings.SHOW_ALTERNATIVE_PRIVATE_SEARCH_ENGINE], false)
+  }
+
+  return defaultSearchEngine
+    ? immutableData.setIn(['settings', settings.DEFAULT_SEARCH_ENGINE], defaultSearchEngine)
+    : immutableData
 }
 
 /**
@@ -977,9 +1127,15 @@ module.exports.loadAppState = () => {
       immutableData = module.exports.runPostMigrations(immutableData)
     }
 
-    locale.init(immutableData.getIn(['settings', settings.LANGUAGE])).then((locale) => {
+    locale.init(immutableData.getIn(['settings', settings.LANGUAGE])).then((lang) => {
       immutableData = setVersionInformation(immutableData)
-      app.setLocale(locale)
+
+      // Set default search engine for locale (if not already set)
+      if (immutableData.getIn(['settings', settings.DEFAULT_SEARCH_ENGINE]) == null) {
+        immutableData = module.exports.setDefaultSearchEngine(immutableData)
+      }
+
+      app.setLocale(lang)
       resolve(immutableData)
     })
   })
@@ -1035,6 +1191,7 @@ module.exports.defaultAppState = () => {
     passwords: [],
     notifications: [],
     temporarySiteSettings: {},
+    tor: {},
     autofill: {
       addresses: {
         guid: [],
@@ -1053,8 +1210,9 @@ module.exports.defaultAppState = () => {
         ignoredTopSites: [],
         pinnedTopSites: []
       },
+      preferences: {},
       welcome: {
-        showOnLoad: !['test', 'development'].includes(process.env.NODE_ENV)
+        showOnLoad: !['test', 'development'].includes(process.env.NODE_ENV) || process.env.BRAVE_SHOW_FIRST_RUN_WELCOME
       }
     },
     trackingProtection: {
@@ -1088,12 +1246,7 @@ module.exports.defaultAppState = () => {
       },
       promotion: {}
     },
-    migrations: {
-      batMercuryTimestamp: now,
-      btc2BatTimestamp: now,
-      btc2BatNotifiedTimestamp: now,
-      btc2BatTransitionPending: false
-    }
+    windowReady: false
   }
 }
 

@@ -10,12 +10,13 @@ const sinon = require('sinon')
 const assert = require('assert')
 const Immutable = require('immutable')
 const fakeElectron = require('../lib/fakeElectron')
+const crypto = require('brave-crypto')
 const _ = require('underscore')
 let NewTabPage, randomSpy, Clock, Stats, FooterInfo, NewPrivateTab
 require('../braveUnit')
 
 const randomWrapper = {
-  random: () => Math.random()
+  uniform: (n) => crypto.random.uniform(n)
 }
 
 describe('NewTab component unit tests', function () {
@@ -30,7 +31,8 @@ describe('NewTab component unit tests', function () {
     mockery.registerMock('../../fonts')
     mockery.registerMock('../../app/extensions/brave/img/newtab/private_tab_pagearea_icon.svg')
     mockery.registerMock('../../app/extensions/brave/img/newtab/private_tab_pagearea_ddgicon.svg')
-    randomSpy = sinon.spy(randomWrapper, 'random')
+    mockery.registerMock('../../app/extensions/brave/img/newtab/toricon.svg')
+    randomSpy = sinon.spy(randomWrapper, 'uniform')
     mockery.registerMock('../../app/common/lib/randomUtil', randomWrapper)
     window.chrome = fakeElectron
     window.CustomEvent = {}

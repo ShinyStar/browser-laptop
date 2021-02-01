@@ -20,7 +20,7 @@ const settings = require('../../js/constants/settings')
 
 // State
 const {getByTabId} = require('../common/state/tabState')
-const tabState = require('../../app/common/state/tabState')
+const tabState = require('../common/state/tabState')
 const appStore = require('../../js/stores/appStore')
 
 // Actions
@@ -39,17 +39,22 @@ const bookmarkUtil = require('../common/lib/bookmarkUtil')
 const isDarwin = platformUtil.isDarwin()
 const isLinux = platformUtil.isLinux()
 const isWindows = platformUtil.isWindows()
+const {templateUrls} = require('./share')
+const {getAllRendererWindows} = require('./windows')
 
 let appMenu = null
 let closedFrames = new Immutable.OrderedMap()
 let lastClosedUrl = null
 let currentLocation = null
 
+const mainMenuIsOSDrawn = isLinux || isDarwin
+
 // Submenu initialization
 const createFileSubmenu = () => {
   const submenu = [
     CommonMenu.newTabMenuItem(),
     CommonMenu.newPrivateTabMenuItem(),
+    CommonMenu.newTorTabMenuItem(mainMenuIsOSDrawn),
     CommonMenu.newPartitionedTabMenuItem(),
     CommonMenu.newWindowMenuItem(),
     CommonMenu.separatorMenuItem,
@@ -473,10 +478,6 @@ const createHelpSubmenu = () => {
     CommonMenu.submitFeedbackMenuItem()
   ]
 
-  if (!isDarwin && !isLinux) {
-    submenu.push(CommonMenu.separatorMenuItem)
-    submenu.push(CommonMenu.checkForUpdateMenuItem())
-  }
   if (!isDarwin) {
     submenu.push(CommonMenu.separatorMenuItem)
     submenu.push(CommonMenu.aboutBraveMenuItem())
@@ -485,7 +486,7 @@ const createHelpSubmenu = () => {
   return submenu
 }
 
-const createDebugSubmenu = () => {
+const createDebugSubmenu = (state) => {
   return [
     {
       // Makes future renderer processes pause when they are created until a debugger appears.
@@ -533,6 +534,20 @@ const createDebugSubmenu = () => {
         const win = BrowserWindow.getActiveWindow()
         appActions.noReportStateModeClicked(win.id)
       }
+    }, {
+      label: 'Allow manual tab discarding',
+      type: 'checkbox',
+      checked: !!getSetting(settings.DEBUG_ALLOW_MANUAL_TAB_DISCARD),
+      click: function (menuItem, browserWindow, e) {
+        appActions.changeSetting(settings.DEBUG_ALLOW_MANUAL_TAB_DISCARD, menuItem.checked)
+      }
+    }, {
+      label: 'Display tab identifiers',
+      type: 'checkbox',
+      checked: !!getSetting(settings.DEBUG_VERBOSE_TAB_INFO),
+      click: function (menuItem, browserWindow, e) {
+        appActions.changeSetting(settings.DEBUG_VERBOSE_TAB_INFO, menuItem.checked)
+      }
     }
   ]
 }
@@ -570,7 +585,7 @@ const createMenu = (state) => {
   ]
 
   if (process.env.NODE_ENV === 'development' || process.env.BRAVE_ENABLE_DEBUG_MENU !== undefined) {
-    template.push({ label: 'Debug', submenu: createDebugSubmenu() })
+    template.push({ label: 'Debug', submenu: createDebugSubmenu(state) })
   }
 
   if (isDarwin) {
@@ -582,7 +597,6 @@ const createMenu = (state) => {
         CommonMenu.preferencesMenuItem(),
         CommonMenu.separatorMenuItem,
         CommonMenu.importBrowserDataMenuItem(),
-        CommonMenu.checkForUpdateMenuItem(),
         CommonMenu.submitFeedbackMenuItem(),
         CommonMenu.separatorMenuItem,
         {
@@ -626,18 +640,26 @@ const createMenu = (state) => {
   }
 }
 
-const setMenuItemChecked = (state, label, checked) => {
-  // Update electron menu (Mac / Linux)
+const setMenuItemAttribute = (state, label, key, value) => {
   const systemMenuItem = menuUtil.getMenuItem(appMenu, label)
-  systemMenuItem.checked = checked
+  systemMenuItem[key] = value
 
   // Update in-memory menu template (Windows)
   if (isWindows) {
     const oldTemplate = state.getIn(['menu', 'template'])
-    const newTemplate = menuUtil.setTemplateItemChecked(oldTemplate, label, checked)
+    const newTemplate = menuUtil.setTemplateItemAttribute(oldTemplate, label, key, value)
     if (newTemplate) {
       appActions.setMenubarTemplate(newTemplate)
     }
+  }
+}
+
+const updateShareMenuItems = (state, enabled) => {
+  for (let key of Object.keys(templateUrls)) {
+    const siteName = menuUtil.extractSiteName(key)
+    const l10nId = key === 'email' ? 'emailPageLink' : 'sharePageLink'
+    const label = locale.translation(l10nId, {siteName: siteName})
+    setMenuItemAttribute(state, label, 'enabled', enabled)
   }
 }
 
@@ -652,14 +674,31 @@ const doAction = (state, action) => {
         const frame = frameStateUtil.getFrameByTabId(state, action.tabId)
         if (frame) {
           currentLocation = frame.location
-          setMenuItemChecked(state, locale.translation('bookmarkPage'), isCurrentLocationBookmarked(state))
+          setMenuItemAttribute(state, locale.translation('bookmarkPage'), 'checked', isCurrentLocationBookmarked(state))
+        }
+        break
+      }
+    case appConstants.APP_WINDOW_CLOSED:
+    case appConstants.APP_WINDOW_CREATED:
+      {
+        const windowCount = getAllRendererWindows().length
+        if (action.actionType === appConstants.APP_WINDOW_CLOSED && windowCount === 0) {
+          updateShareMenuItems(state, false)
+        } else if (action.actionType === appConstants.APP_WINDOW_CREATED && windowCount === 1) {
+          updateShareMenuItems(state, true)
         }
         break
       }
     case appConstants.APP_CHANGE_SETTING:
       if (action.key === settings.SHOW_BOOKMARKS_TOOLBAR) {
         // Update the checkbox next to "Bookmarks Toolbar" (Bookmarks menu)
-        setMenuItemChecked(state, locale.translation('bookmarksToolbar'), action.value)
+        setMenuItemAttribute(state, locale.translation('bookmarksToolbar'), 'checked', action.value)
+      }
+      if (action.key === settings.DEBUG_ALLOW_MANUAL_TAB_DISCARD) {
+        setMenuItemAttribute(state, 'Allow manual tab discarding', 'checked', action.value)
+      }
+      if (action.key === settings.DEBUG_VERBOSE_TAB_INFO) {
+        setMenuItemAttribute(state, 'Display tab identifiers', 'checked', action.value)
       }
       break
     case windowConstants.WINDOW_UNDO_CLOSED_FRAME:

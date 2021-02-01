@@ -114,7 +114,8 @@ console.log('Building version ' + VersionInfo.braveVersion + ' in ' + buildDir +
 
 cmds = cmds.concat([
   '"./node_modules/.bin/webpack"',
-  'npm run checks',
+  // NOTE: api.nodesecurity.io seems to be down?
+  // 'npm run checks',
   `node ./node_modules/electron-packager/cli.js . ${appName}` +
     ' --overwrite=true' +
     ' --ignore="' + ignoredPaths.join('|') + '"' +
@@ -157,6 +158,15 @@ if (isLinux) {
   // Make sure the Brave.exe binary is squirrel aware so we get squirrel events and so that Squirrel doesn't auto create shortcuts.
   cmds.push(`"node_modules/rcedit/bin/rcedit.exe" ./${appName}-win32-` + arch + `/${appName}.exe --set-version-string "SquirrelAwareVersion" "1"`)
 }
+
+// Verify tor binaries and bundle with Brave
+var torPath
+if (isDarwin) {
+  torPath = path.join(buildDir, `${appName}.app`, 'Contents', 'Resources', 'extensions', 'bin')
+} else {
+  torPath = path.join(buildDir, 'resources', 'extensions', 'bin')
+}
+cmds.push('npm run package-tor ' + torPath)
 
 if (isDarwin) {
   const macAppName = `${appName}.app`

@@ -9,18 +9,21 @@ const sinon = require('sinon')
 const mockery = require('mockery')
 const settings = require('../../../../../js/constants/settings')
 const appActions = require('../../../../../js/actions/appActions')
-const migrationState = require('../../../../../app/common/state/migrationState')
 const batPublisher = require('bat-publisher')
 const ledgerMediaProviders = require('../../../../../app/common/constants/ledgerMediaProviders')
 const fs = require('fs')
+const ledgerStatuses = require('../../../../../app/common/constants/ledgerStatuses')
+const promotionStatuses = require('../../../../../app/common/constants/promotionStatuses')
 
 describe('ledger api unit tests', function () {
   let ledgerApi
   let ledgerNotificationsApi
   let ledgerState
   let updateState
+  let ledgerUtil
   let isBusy = false
   let ledgerClient
+  let ledgerClientObject
   let ledgerPublisher
   let tabState = Immutable.fromJS({
     partition: 'persist:partition-1'
@@ -28,37 +31,33 @@ describe('ledger api unit tests', function () {
   let request
   let walletPassphraseReturn
   let updater
+  let aboutPreferencesState
+  let isReadyToReconcile = false
 
   // constants
-  const xhr = 'https://www.youtube.com/api/stats/watchtime?docid=kLiLOkzLetE&st=11.338&et=21.339'
   const videoId = 'youtube_kLiLOkzLetE'
   const publisherKey = 'youtube#channel:UCFNTTISby1c_H-rm5Ww5rZg'
 
   // settings
   let contributionAmount = 10
+  let paymentsMinVisits = 5
   let paymentsMinVisitTime = 5000
   let paymentsNotifications = true
   let paymentsAllowPromotions = true
   let contributionAmountSet = true
 
   // spies
-  let ledgerTransitionSpy
-  let ledgerTransitionedSpy
-  let onBitcoinToBatTransitionedSpy
   let onLedgerCallbackSpy
-  let onBitcoinToBatBeginTransitionSpy
   let onChangeSettingSpy
   let ledgersetPromotionSpy
   let ledgergetPromotionSpy
   let ledgerSetTimeUntilReconcile
-  let onPublisherOptionUpdate
 
   const defaultAppState = Immutable.fromJS({
     cache: {
       ledgerVideos: {}
     },
-    ledger: {},
-    migrations: {}
+    ledger: {}
   })
 
   before(function () {
@@ -85,6 +84,8 @@ describe('ledger api unit tests', function () {
                 : null
           case settings.PAYMENTS_MINIMUM_VISIT_TIME:
             return paymentsMinVisitTime
+          case settings.PAYMENTS_MINIMUM_VISITS:
+            return paymentsMinVisits
           case settings.PAYMENTS_NOTIFICATIONS:
             return paymentsNotifications
           case settings.PAYMENTS_ALLOW_PROMOTIONS:
@@ -96,11 +97,8 @@ describe('ledger api unit tests', function () {
     request = require('../../../../../js/lib/request')
     mockery.registerMock('../../../js/lib/request', request)
     mockery.registerMock('../../../js/actions/appActions', appActions)
-    onBitcoinToBatTransitionedSpy = sinon.spy(appActions, 'onBitcoinToBatTransitioned')
     onLedgerCallbackSpy = sinon.spy(appActions, 'onLedgerCallback')
-    onBitcoinToBatBeginTransitionSpy = sinon.spy(appActions, 'onBitcoinToBatBeginTransition')
     onChangeSettingSpy = sinon.spy(appActions, 'changeSetting')
-    onPublisherOptionUpdate = sinon.spy(appActions, 'onPublisherOptionUpdate')
     mockery.registerMock('fs', fs)
 
     // default to tab state which should be tracked
@@ -110,7 +108,10 @@ describe('ledger api unit tests', function () {
 
     // ledger client stubbing
     ledgerClient = sinon.stub()
-    const lc = {
+    ledgerClientObject = {
+      ballots: function () {
+        return 1
+      },
       sync: function (callback) { return false },
       getBraveryProperties: function () {
         return {
@@ -132,19 +133,14 @@ describe('ledger api unit tests', function () {
       getWalletProperties: function (amount, currency, callback) {
         callback(null, {})
       },
-      transition: function (paymentId, callback) {
-        callback()
-      },
       getPaymentId: function () {
         return 'payementIdGoesHere'
       },
+      memo: () => {},
       properties: {
         wallet: {
           paymentId: 12345
         }
-      },
-      transitioned: function () {
-        return {}
       },
       setBraveryProperties: function (clientProperties, callback) {
         if (typeof callback === 'function') {
@@ -154,31 +150,38 @@ describe('ledger api unit tests', function () {
         }
       },
       state: {
-        transactions: []
+        transactions: [],
+        reconcileStamp: 1000
       },
       busyP: function () {
         return isBusy
       },
-      publisherTimestamp: function () {
-        return 0
-      },
       getPromotion: () => {},
       setPromotion: () => {},
-      setTimeUntilReconcile: () => {}
+      setTimeUntilReconcile: () => {},
+      isReadyToReconcile: () => isReadyToReconcile,
+      recoverWallet: () => {},
+      getPromotionCaptcha: () => {},
+      report: () => {},
+      fetchPublisherInfo: function (callback) {
+        callback(null, {})
+      }
     }
     window.getWalletPassphrase = (parsedData) => {
+      if (walletPassphraseReturn === 'error') {
+        throw TypeError('Invalid entropy')
+      }
+
       return walletPassphraseReturn
     }
     ledgerClient.prototype.boolion = function (value) { return false }
     ledgerClient.prototype.getWalletPassphrase = function (parsedData) {
       return window.getWalletPassphrase(parsedData)
     }
-    ledgerTransitionSpy = sinon.spy(lc, 'transition')
-    ledgerTransitionedSpy = sinon.spy(lc, 'transitioned')
-    ledgersetPromotionSpy = sinon.spy(lc, 'setPromotion')
-    ledgergetPromotionSpy = sinon.spy(lc, 'getPromotion')
-    ledgerSetTimeUntilReconcile = sinon.spy(lc, 'setTimeUntilReconcile')
-    ledgerClient.returns(lc)
+    ledgersetPromotionSpy = sinon.spy(ledgerClientObject, 'setPromotion')
+    ledgergetPromotionSpy = sinon.spy(ledgerClientObject, 'getPromotion')
+    ledgerSetTimeUntilReconcile = sinon.spy(ledgerClientObject, 'setTimeUntilReconcile')
+    ledgerClient.returns(ledgerClientObject)
     mockery.registerMock('bat-client', ledgerClient)
 
     // ledger publisher stubbing
@@ -204,17 +207,17 @@ describe('ledger api unit tests', function () {
     })
 
     ledgerNotificationsApi = require('../../../../../app/browser/api/ledgerNotifications')
+    ledgerUtil = require('../../../../../app/common/lib/ledgerUtil')
     ledgerState = require('../../../../../app/common/state/ledgerState')
     updateState = require('../../../../../app/common/state/updateState')
+    aboutPreferencesState = require('../../../../../app/common/state/aboutPreferencesState')
     updater = require('../../../../../app/updater')
 
     // once everything is stubbed, load the ledger
     ledgerApi = require('../../../../../app/browser/api/ledger')
   })
   after(function () {
-    onBitcoinToBatTransitionedSpy.restore()
     onLedgerCallbackSpy.restore()
-    onBitcoinToBatBeginTransitionSpy.restore()
     onChangeSettingSpy.restore()
     mockery.deregisterAll()
     mockery.disable()
@@ -230,28 +233,44 @@ describe('ledger api unit tests', function () {
     })
 
     describe('initialize', function () {
-      let notificationsInitStub
+      let notificationsInitStub, checkPublisherInfoUpdateSpy
+
+      before(function () {
+        checkPublisherInfoUpdateSpy = sinon.spy(ledgerApi, 'checkPublisherInfoUpdate')
+      })
+
       beforeEach(function () {
         notificationsInitStub = sinon.stub(ledgerNotificationsApi, 'init')
       })
 
       afterEach(function () {
         notificationsInitStub.restore()
+        checkPublisherInfoUpdateSpy.reset()
       })
 
       after(function () {
         ledgerApi.setSynopsis(undefined)
+        checkPublisherInfoUpdateSpy.restore()
       })
 
       it('calls notifications.init', function () {
         ledgerApi.initialize(defaultAppState, true)
         assert(notificationsInitStub.calledOnce)
       })
+
+      it('doesn\'t check for verified publisher updates when payments are disabled', function () {
+        ledgerApi.initialize(defaultAppState, false)
+        assert(checkPublisherInfoUpdateSpy.notCalled)
+      })
+
+      it('checks for verified publisher updates when payments are disabled', function () {
+        ledgerApi.initialize(defaultAppState, true)
+        assert(checkPublisherInfoUpdateSpy.calledOnce)
+      })
     })
 
     describe('onInitRead', function () {
       let parsedLedgerData
-      let onLaunchSpy
       let setPaymentInfoSpy
       before(function () {
         parsedLedgerData = {
@@ -266,94 +285,16 @@ describe('ledger api unit tests', function () {
         contributionAmount = 10
       })
       before(function () {
-        onLaunchSpy = sinon.spy(ledgerNotificationsApi, 'onLaunch')
         setPaymentInfoSpy = sinon.spy(ledgerApi, 'setPaymentInfo')
       })
       after(function () {
-        onLaunchSpy.restore()
         setPaymentInfoSpy.restore()
         ledgerApi.setSynopsis(undefined)
-      })
-      it('calls notifications.onLaunch', function () {
-        onLaunchSpy.reset()
-        ledgerApi.onInitRead(defaultAppState, parsedLedgerData)
-        assert(onLaunchSpy.calledOnce)
       })
       it('calls setPaymentInfo with contribution amount', function () {
         setPaymentInfoSpy.reset()
         ledgerApi.onInitRead(defaultAppState, parsedLedgerData)
         assert(setPaymentInfoSpy.withArgs(10).calledOnce)
-      })
-    })
-
-    describe('checkBtcBatMigrated', function () {
-      let transitionWalletToBatStub
-      before(function () {
-        transitionWalletToBatStub = sinon.stub(ledgerApi, 'transitionWalletToBat')
-      })
-      after(function () {
-        transitionWalletToBatStub.restore()
-      })
-
-      describe('when not a new install and wallet has not been upgraded', function () {
-        let result
-        before(function () {
-          const notMigratedYet = defaultAppState.merge(Immutable.fromJS({
-            firstRunTimestamp: 12345,
-            migrations: {
-              batMercuryTimestamp: 34512,
-              btc2BatTimestamp: 34512,
-              btc2BatNotifiedTimestamp: 34512,
-              btc2BatTransitionPending: false
-            }
-          }))
-          assert.equal(migrationState.inTransition(notMigratedYet), false)
-          transitionWalletToBatStub.reset()
-          result = ledgerApi.checkBtcBatMigrated(notMigratedYet, true)
-        })
-        it('sets transition status to true', function () {
-          assert(migrationState.inTransition(result))
-        })
-        it('calls transitionWalletToBat', function () {
-          assert(transitionWalletToBatStub.calledOnce)
-        })
-      })
-
-      describe('when a transition is already being shown', function () {
-        it('sets transition to false if new install', function () {
-          const stuckOnMigrate = defaultAppState.merge(Immutable.fromJS({
-            firstRunTimestamp: 12345,
-            migrations: {
-              batMercuryTimestamp: 12345,
-              btc2BatTimestamp: 12345,
-              btc2BatNotifiedTimestamp: 12345,
-              btc2BatTransitionPending: true
-            }
-          }))
-          assert(migrationState.isNewInstall(stuckOnMigrate))
-          assert.equal(migrationState.hasUpgradedWallet(stuckOnMigrate), false)
-          assert(migrationState.inTransition(stuckOnMigrate))
-
-          const result = ledgerApi.checkBtcBatMigrated(stuckOnMigrate, true)
-          assert.equal(migrationState.inTransition(result), false)
-        })
-        it('sets transition to false if wallet has been upgraded', function () {
-          const stuckOnMigrate = defaultAppState.merge(Immutable.fromJS({
-            firstRunTimestamp: 12345,
-            migrations: {
-              batMercuryTimestamp: 34512,
-              btc2BatTimestamp: 54321,
-              btc2BatNotifiedTimestamp: 34512,
-              btc2BatTransitionPending: true
-            }
-          }))
-          assert.equal(migrationState.isNewInstall(stuckOnMigrate), false)
-          assert(migrationState.hasUpgradedWallet(stuckOnMigrate))
-          assert(migrationState.inTransition(stuckOnMigrate))
-
-          const result = ledgerApi.checkBtcBatMigrated(stuckOnMigrate, true)
-          assert.equal(migrationState.inTransition(result), false)
-        })
       })
     })
 
@@ -365,12 +306,17 @@ describe('ledger api unit tests', function () {
       describe('prune synopsis', function () {
         let pruneSynopsisSpy, appActionsSpy
 
-        beforeEach(function () {
+        before(function () {
           pruneSynopsisSpy = sinon.spy(ledgerApi, 'pruneSynopsis')
           appActionsSpy = sinon.spy(appActions, 'onPruneSynopsis')
         })
 
         afterEach(function () {
+          pruneSynopsisSpy.reset()
+          appActionsSpy.reset()
+        })
+
+        after(function () {
           pruneSynopsisSpy.restore()
           appActionsSpy.restore()
         })
@@ -396,6 +342,98 @@ describe('ledger api unit tests', function () {
           ledgerApi.synopsisNormalizer(defaultAppState, null, false, true)
           assert(pruneSynopsisSpy.calledOnce)
           assert(appActionsSpy.calledOnce)
+        })
+      })
+
+      describe('only pinned items with total below 100%', function () {
+        let normalizePinnedSpy, roundToTargetSpy, visiblePStub
+
+        const dataState = defaultAppState
+          .setIn(['ledger', 'synopsis', 'publishers'], Immutable.fromJS({
+            'site1': {
+              options: {
+                exclude: false
+              },
+              pinPercentage: 30,
+              scores: {
+                concave: 9.249426617127623,
+                visits: 3
+              },
+              weight: 30
+            },
+            'site2': {
+              options: {
+                exclude: false
+              },
+              pinPercentage: 20,
+              scores: {
+                concave: 3.249426617127623,
+                visits: 3
+              },
+              weight: 20
+            },
+            'site3': {
+              options: {
+                exclude: false
+              },
+              pinPercentage: 20,
+              scores: {
+                concave: 1.249426617127623,
+                visits: 3
+              },
+              weight: 20
+            }
+          }))
+
+        const expectedSate = dataState
+          .setIn(['ledger', 'about', 'synopsis'], Immutable.Map())
+          .setIn(['ledger', 'about', 'synopsisOptions'], Immutable.Map())
+
+        before(function () {
+          normalizePinnedSpy = sinon.spy(ledgerApi, 'normalizePinned')
+          roundToTargetSpy = sinon.spy(ledgerApi, 'roundToTarget')
+          visiblePStub = sinon.stub(ledgerUtil, 'visibleP', () => true)
+        })
+
+        afterEach(function () {
+          normalizePinnedSpy.reset()
+          roundToTargetSpy.reset()
+        })
+
+        after(function () {
+          normalizePinnedSpy.restore()
+          roundToTargetSpy.restore()
+          visiblePStub.restore()
+        })
+
+        it('changed publisher is not known', function () {
+          let result = ledgerApi.synopsisNormalizer(dataState, null)
+          assert(normalizePinnedSpy.calledOnce)
+          assert(roundToTargetSpy.calledOnce)
+          result = result.setIn(['ledger', 'about', 'synopsis'], {})
+          const newState = expectedSate
+            .setIn(['ledger', 'synopsis', 'publishers', 'site1', 'pinPercentage'], 43)
+            .setIn(['ledger', 'synopsis', 'publishers', 'site1', 'weight'], 42.857142857142854)
+            .setIn(['ledger', 'synopsis', 'publishers', 'site2', 'pinPercentage'], 29)
+            .setIn(['ledger', 'synopsis', 'publishers', 'site2', 'weight'], 28.57142857142857)
+            .setIn(['ledger', 'synopsis', 'publishers', 'site3', 'pinPercentage'], 28)
+            .setIn(['ledger', 'synopsis', 'publishers', 'site3', 'weight'], 28.57142857142857)
+          assert.deepEqual(result.toJS(), newState.toJS())
+        })
+
+        it('changed publisher is known', function () {
+          let result = ledgerApi.synopsisNormalizer(dataState, 'site2')
+          assert(normalizePinnedSpy.calledOnce)
+          assert(roundToTargetSpy.calledOnce)
+          result = result.setIn(['ledger', 'about', 'synopsis'], {})
+          const newState = expectedSate
+            .setIn(['ledger', 'synopsis', 'publishers', 'site1', 'pinPercentage'], 48)
+            .setIn(['ledger', 'synopsis', 'publishers', 'site1', 'weight'], 48)
+            .setIn(['ledger', 'synopsis', 'publishers', 'site2', 'pinPercentage'], 20)
+            .setIn(['ledger', 'synopsis', 'publishers', 'site2', 'weight'], 20)
+            .setIn(['ledger', 'synopsis', 'publishers', 'site3', 'pinPercentage'], 32)
+            .setIn(['ledger', 'synopsis', 'publishers', 'site3', 'weight'], 32)
+          assert.deepEqual(result.toJS(), newState.toJS())
         })
       })
     })
@@ -443,8 +481,7 @@ describe('ledger api unit tests', function () {
                 }
               }
             }
-          },
-          migrations: {}
+          }
         }
 
         const result = ledgerApi.pruneSynopsis(defaultAppState)
@@ -453,109 +490,112 @@ describe('ledger api unit tests', function () {
     })
 
     describe('checkVerifiedStatus', function () {
-      let verifiedPSpy
-      let returnValue = false
+      let updatePublishersSpy
 
       before(function () {
-        onPublisherOptionUpdate.reset()
-        verifiedPSpy = sinon.spy(ledgerApi, 'verifiedP')
-
-        ledgerApi.setClient({
-          publisherInfo: function (publisherKey, callback) {
-            callback(null, {
-              publisher: 'test.io',
-              properties: {
-                verified: returnValue
-              }
-            })
-          },
-          publishersInfo: function (publisherKey, callback) {
-            publisherKey.forEach(key => {
-              callback(null, {
-                publisher: key,
-                properties: {
-                  verified: returnValue
-                }
-              })
-            })
-          }
-        })
-      })
-
-      afterEach(function () {
-        returnValue = false
-        verifiedPSpy.reset()
-        onPublisherOptionUpdate.reset()
+        updatePublishersSpy = sinon.spy(ledgerApi, 'updatePublishers')
       })
 
       after(function () {
-        verifiedPSpy.restore()
-        onPublisherOptionUpdate.restore()
-        ledgerApi.setClient(undefined)
+        updatePublishersSpy.restore()
+      })
+
+      afterEach(function () {
+        updatePublishersSpy.reset()
       })
 
       it('null case', function () {
         const result = ledgerApi.checkVerifiedStatus(defaultAppState)
-        assert.deepEqual(result.toJS(), defaultAppState.toJS())
-        assert(verifiedPSpy.notCalled)
+        assert.equal(defaultAppState, result)
       })
 
-      it('only update if timestamp is older then current', function () {
-        const newState = defaultAppState
-          .setIn(['ledger', 'publisherTimestamp'], 20)
-          .setIn(['ledger', 'synopsis', 'publishers', 'test.io', 'options', 'verifiedTimestamp'], 20)
-        const result = ledgerApi.checkVerifiedStatus(newState, 'test.io')
-        assert.deepEqual(result.toJS(), newState.toJS())
-        assert(verifiedPSpy.notCalled)
+      it('converts a single key to a one element array', function () {
+        ledgerApi.checkVerifiedStatus(defaultAppState, 'brave.com')
+        assert(updatePublishersSpy.withArgs(defaultAppState, ['brave.com']).calledOnce)
       })
 
-      it('update when timestamp is older', function () {
-        returnValue = true
-        const newState = defaultAppState
-          .setIn(['ledger', 'publisherTimestamp'], 20)
-          .setIn(['ledger', 'synopsis', 'publishers', 'test.io', 'options', 'verifiedTimestamp'], 10)
-
-        const result = ledgerApi.checkVerifiedStatus(newState, 'test.io')
-        assert.deepEqual(result.toJS(), newState.toJS())
-        assert(verifiedPSpy.calledOnce)
-        assert(onPublisherOptionUpdate.withArgs('test.io', 'verified', true).calledOnce)
-      })
-
-      it('change publisher verified status from true to false', function () {
-        const newState = defaultAppState
-          .setIn(['ledger', 'publisherTimestamp'], 20)
-          .setIn(['ledger', 'synopsis', 'publishers', 'test.io', 'options', 'verifiedTimestamp'], 10)
-          .setIn(['ledger', 'synopsis', 'publishers', 'test.io', 'options', 'verified'], true)
-
-        const result = ledgerApi.checkVerifiedStatus(newState, 'test.io')
-        assert.deepEqual(result.toJS(), newState.toJS())
-        assert(verifiedPSpy.calledOnce)
-        assert(onPublisherOptionUpdate.withArgs('test.io', 'verified', false).calledOnce)
-      })
-
-      it('handle multiple publishers', function () {
-        const newState = defaultAppState
-          .setIn(['ledger', 'publisherTimestamp'], 20)
-          .setIn(['ledger', 'synopsis', 'publishers', 'test.io', 'options', 'verifiedTimestamp'], 10)
-          .setIn(['ledger', 'synopsis', 'publishers', 'test1.io', 'options', 'verifiedTimestamp'], 15)
-          .setIn(['ledger', 'synopsis', 'publishers', 'test2.io', 'options', 'verifiedTimestamp'], 20)
-          .setIn(['ledger', 'synopsis', 'publishers', 'test3.io', 'options', 'verifiedTimestamp'], 30)
-
-        const result = ledgerApi.checkVerifiedStatus(newState, [
-          'test1.io',
-          'test2.io',
-          'test3.io',
-          'test.io'
-        ])
-        assert.deepEqual(result.toJS(), newState.toJS())
-        assert(verifiedPSpy.withArgs(sinon.match.any, ['test1.io', 'test.io'], sinon.match.any).calledOnce)
-        assert.deepEqual(onPublisherOptionUpdate.getCall(0).args, ['test1.io', 'verified', false])
-        assert.deepEqual(onPublisherOptionUpdate.getCall(2).args, ['test.io', 'verified', false])
+      it('calls verifiedP with array of keys', function () {
+        const publisherKeys = ['brave.com', 'clifton.io']
+        ledgerApi.checkVerifiedStatus(defaultAppState, publisherKeys)
+        assert(updatePublishersSpy.withArgs(defaultAppState, publisherKeys).calledOnce)
       })
     })
 
     describe('onMediaRequest', function () {
+      let processMediaDataSpy
+      const url = 'https://video-edge-f0f586.sjc01.hls.ttvnw.net/v1/segment/CuDNI7xCy5CGJ8g7G3thdHT26OW_DhnEuVw0tRGN-DKhJxrRTeGe...'
+
+      beforeEach(function () {
+        processMediaDataSpy = sinon.spy(ledgerApi, 'processMediaData')
+      })
+
+      afterEach(function () {
+        processMediaDataSpy.restore()
+      })
+
+      it('does nothing if input is null', function () {
+        const result = ledgerApi.onMediaRequest(defaultAppState)
+        assert.deepEqual(result.toJS(), defaultAppState.toJS())
+        assert(processMediaDataSpy.notCalled)
+      })
+
+      it('does nothing if input is null', function () {
+        const result = ledgerApi.onMediaRequest(defaultAppState, url, ledgerMediaProviders.TWITCH, Immutable.fromJS({
+          firstPartyUrl: 'https://www.twitch.tv/videos/241926348',
+          uploadData: [{
+            bytes: new Uint8Array([])
+          }]
+        }))
+        assert.deepEqual(result.toJS(), defaultAppState.toJS())
+        assert(processMediaDataSpy.notCalled)
+      })
+
+      it('parsed data is single object', function () {
+        const result = ledgerApi.onMediaRequest(defaultAppState, url, ledgerMediaProviders.TWITCH, Immutable.fromJS({
+          firstPartyUrl: 'https://www.twitch.tv/videos/241926348',
+          uploadData: [{
+            bytes: new Uint8Array([
+              100, 97, 116, 97, 61, 87, 51, 115, 105, 90, 88, 90, 108, 98, 110, 81, 105, 79, 105,
+              74, 116, 97, 87, 53, 49, 100, 71, 85, 116, 100, 50, 70, 48, 89, 50, 104, 108, 90, 67, 73, 115, 73, 110,
+              66, 121, 98, 51, 66, 108, 99, 110, 82, 112, 90, 88, 77, 105, 79, 110, 115, 105, 89, 50, 104, 104, 98,
+              109, 53, 108, 98, 67, 73, 54, 73, 110, 82, 51, 73, 110, 49, 57, 88, 81, 61, 61
+            ])
+          }]
+        }))
+
+        assert(processMediaDataSpy.calledOnce)
+        assert.notDeepEqual(result.toJS(), defaultAppState.toJS())
+      })
+
+      it('parsed data is array of objects', function () {
+        const result = ledgerApi.onMediaRequest(defaultAppState, url, ledgerMediaProviders.TWITCH, Immutable.fromJS({
+          firstPartyUrl: 'https://www.twitch.tv/videos/241926348',
+          uploadData: [{
+            bytes: new Uint8Array([
+              100, 97, 116, 97, 61, 87, 51, 115, 105, 90, 88, 90, 108, 98, 110, 81, 105, 79, 105,
+              74, 50, 97, 87, 82, 108, 98, 121, 49, 119, 98, 71, 70, 53, 73, 105, 119, 105, 99, 72, 74, 118, 99, 71,
+              86, 121, 100, 71, 108, 108, 99, 121, 73, 54, 101, 121, 74, 106, 97, 71, 70, 117, 98, 109, 86, 115, 73,
+              106, 111, 105, 100, 72, 99, 105, 102, 88, 48, 115, 101, 121, 74, 108, 100, 109, 86, 117, 100, 67, 73, 54,
+              73, 110, 90, 112, 90, 71, 86, 118, 88, 50, 86, 121, 99, 109, 57, 121, 73, 105, 119, 105, 99, 72, 74, 118,
+              99, 71, 86, 121, 100, 71, 108, 108, 99, 121, 73, 54, 101, 121, 74, 106, 97, 71, 70, 117, 98, 109, 86,
+              115, 73, 106, 111, 105, 100, 72, 99, 105, 102, 88, 49, 100
+            ])
+          }]
+        }))
+
+        assert(processMediaDataSpy.calledTwice)
+        assert.notDeepEqual(result.toJS(), defaultAppState.toJS())
+      })
+    })
+
+    describe('processMediaData', function () {
       let mediaSpy, saveVisitSpy
+
+      const parsedData = {
+        docid: 'kLiLOkzLetE',
+        st: '11.338',
+        et: '21.339'
+      }
 
       const cacheAppState = defaultAppState
         .setIn(['cache', 'ledgerVideos', videoId], Immutable.fromJS({
@@ -583,7 +623,7 @@ describe('ledger api unit tests', function () {
       })
 
       it('does nothing if input is null', function () {
-        const result = ledgerApi.onMediaRequest(defaultAppState)
+        const result = ledgerApi.processMediaData(defaultAppState)
         assert.deepEqual(result.toJS(), defaultAppState.toJS())
         assert(mediaSpy.notCalled)
         assert(saveVisitSpy.notCalled)
@@ -607,22 +647,26 @@ describe('ledger api unit tests', function () {
           tabState = savedTabState
         })
         it('does nothing if tab is private', function () {
-          const xhr2 = 'https://www.youtube.com/api/stats/watchtime?docid=kLiLOkzLetE&st=20.338&et=21.339'
-          ledgerApi.onMediaRequest(cacheAppState, xhr2, ledgerMediaProviders.YOUTUBE, 1)
+          const data = {
+            docid: 'kLiLOkzLetE',
+            st: '20.338',
+            et: '21.339'
+          }
+          ledgerApi.processMediaData(cacheAppState, data, ledgerMediaProviders.YOUTUBE, Immutable.fromJS({tabId: 1}))
           assert(mediaSpy.notCalled)
           assert(saveVisitSpy.notCalled)
         })
       })
 
       it('set currentMediaKey when it is different than saved', function () {
-        ledgerApi.onMediaRequest(defaultAppState, xhr, ledgerMediaProviders.YOUTUBE, 1)
+        ledgerApi.processMediaData(defaultAppState, parsedData, ledgerMediaProviders.YOUTUBE, Immutable.fromJS({tabId: 1}))
         assert.equal(ledgerApi.getCurrentMediaKey(), videoId)
         assert(mediaSpy.calledOnce)
         assert(saveVisitSpy.notCalled)
       })
 
       it('get data from cache, if we have publisher in synopsis', function () {
-        ledgerApi.onMediaRequest(cacheAppState, xhr, ledgerMediaProviders.YOUTUBE, 1)
+        ledgerApi.processMediaData(cacheAppState, parsedData, ledgerMediaProviders.YOUTUBE, Immutable.fromJS({tabId: 1}))
         assert(mediaSpy.notCalled)
         assert(saveVisitSpy.withArgs(cacheAppState, publisherKey, {
           duration: 10001,
@@ -635,14 +679,14 @@ describe('ledger api unit tests', function () {
         const state = defaultAppState.setIn(['cache', 'ledgerVideos', videoId], Immutable.fromJS({
           publisher: publisherKey
         }))
-        ledgerApi.onMediaRequest(state, xhr, ledgerMediaProviders.YOUTUBE, 1)
+        ledgerApi.processMediaData(state, parsedData, ledgerMediaProviders.YOUTUBE, Immutable.fromJS({tabId: 1}))
         assert(mediaSpy.calledOnce)
         assert(saveVisitSpy.notCalled)
       })
 
       it('revisited if visiting the same media in the same tab', function () {
         // first call, revisit false
-        ledgerApi.onMediaRequest(cacheAppState, xhr, ledgerMediaProviders.YOUTUBE, 1)
+        ledgerApi.processMediaData(cacheAppState, parsedData, ledgerMediaProviders.YOUTUBE, Immutable.fromJS({tabId: 1}))
         assert.equal(ledgerApi.getCurrentMediaKey(), videoId)
         assert(saveVisitSpy.withArgs(cacheAppState, publisherKey, {
           duration: 10001,
@@ -651,7 +695,7 @@ describe('ledger api unit tests', function () {
         }).calledOnce)
 
         // second call, revisit true
-        ledgerApi.onMediaRequest(cacheAppState, xhr, ledgerMediaProviders.YOUTUBE, 1)
+        ledgerApi.processMediaData(cacheAppState, parsedData, ledgerMediaProviders.YOUTUBE, Immutable.fromJS({tabId: 1}))
         assert(mediaSpy.notCalled)
         assert(saveVisitSpy.withArgs(cacheAppState, publisherKey, {
           duration: 10001,
@@ -663,7 +707,7 @@ describe('ledger api unit tests', function () {
       it('revisited if visiting media in the background tab', function () {
         // first call, revisit false
         ledgerApi.setCurrentMediaKey('11')
-        ledgerApi.onMediaRequest(cacheAppState, xhr, ledgerMediaProviders.YOUTUBE, 10)
+        ledgerApi.processMediaData(cacheAppState, parsedData, ledgerMediaProviders.YOUTUBE, Immutable.fromJS({tabId: 10}))
         assert.equal(ledgerApi.getCurrentMediaKey(), '11')
         assert(saveVisitSpy.withArgs(cacheAppState, publisherKey, {
           duration: 10001,
@@ -683,14 +727,14 @@ describe('ledger api unit tests', function () {
             }
           }))
 
-        ledgerApi.onMediaRequest(badState, xhr, ledgerMediaProviders.YOUTUBE, 10)
+        ledgerApi.processMediaData(badState, parsedData, ledgerMediaProviders.YOUTUBE, Immutable.fromJS({tabId: 10}))
         assert(mediaSpy.calledOnce)
         assert(saveVisitSpy.notCalled)
       })
     })
 
     describe('onMediaPublisher', function () {
-      let saveVisitSpy, verifiedPStub, setPublisherSpy
+      let saveVisitSpy, updatePublishersStub, setPublisherSpy
 
       const expectedState = Immutable.fromJS({
         cache: {
@@ -715,8 +759,7 @@ describe('ledger api unit tests', function () {
               }
             }
           }
-        },
-        migrations: {}
+        }
       })
 
       const response = Immutable.fromJS({
@@ -728,7 +771,7 @@ describe('ledger api unit tests', function () {
       })
 
       before(function () {
-        verifiedPStub = sinon.stub(ledgerApi, 'verifiedP', (state, publisherKey, fn) => state)
+        updatePublishersStub = sinon.stub(ledgerApi, 'updatePublishers', (state, publisherKey, fn) => state)
         saveVisitSpy = sinon.spy(ledgerApi, 'saveVisit')
         setPublisherSpy = sinon.spy(ledgerState, 'setPublisher')
       })
@@ -750,14 +793,14 @@ describe('ledger api unit tests', function () {
       })
 
       after(function () {
-        verifiedPStub.restore()
+        updatePublishersStub.restore()
         saveVisitSpy.restore()
         setPublisherSpy.restore()
       })
 
       afterEach(function () {
         ledgerApi.setSynopsis(undefined)
-        verifiedPStub.reset()
+        updatePublishersStub.reset()
         saveVisitSpy.reset()
         setPublisherSpy.reset()
       })
@@ -794,11 +837,7 @@ describe('ledger api unit tests', function () {
           cache: {
             ledgerVideos: {
               'youtube_kLiLOkzLetE': {
-                publisher: 'youtube#channel:UCFNTTISby1c_H-rm5Ww5rZg',
-                faviconName: 'Brave',
-                providerName: 'Youtube',
-                faviconURL: 'data:image/jpeg;base64,...',
-                publisherURL: 'https://brave.com'
+                publisher: 'youtube#channel:UCFNTTISby1c_H-rm5Ww5rZg'
               }
             }
           },
@@ -816,8 +855,7 @@ describe('ledger api unit tests', function () {
                 }
               }
             }
-          },
-          migrations: {}
+          }
         })
 
         const state = ledgerApi.onMediaPublisher(newState, videoId, response, 1000, false)
@@ -838,11 +876,7 @@ describe('ledger api unit tests', function () {
           cache: {
             ledgerVideos: {
               'youtube_kLiLOkzLetE': {
-                publisher: 'youtube#channel:UCFNTTISby1c_H-rm5Ww5rZg',
-                faviconName: 'Brave',
-                providerName: 'Youtube',
-                faviconURL: 'data:image/jpeg;base64,...',
-                publisherURL: 'https://brave.com'
+                publisher: 'youtube#channel:UCFNTTISby1c_H-rm5Ww5rZg'
               }
             }
           },
@@ -860,8 +894,7 @@ describe('ledger api unit tests', function () {
                 }
               }
             }
-          },
-          migrations: {}
+          }
         })
 
         const state = ledgerApi.onMediaPublisher(newState, videoId, response, 1000, false)
@@ -870,111 +903,31 @@ describe('ledger api unit tests', function () {
         assert.deepEqual(state.toJS(), expectedState.toJS())
       })
     })
-
-    describe('roundtrip', function () {
-      let requestStub
-      const simpleCallback = sinon.stub()
-      let responseCode = 200
-
-      before(function () {
-        requestStub = sinon.stub(request, 'request', (options, callback) => {
-          switch (responseCode) {
-            case 403:
-              callback(null, {
-                statusCode: 403,
-                headers: {},
-                statusMessage: '<html><body>Your requested URL has been blocked by the URL Filter database module of {{EnterpriseName}}. The URL is listed in categories that are not allowed by your administrator at this time.</body></html>',
-                httpVersionMajor: 1,
-                httpVersionMinor: 1
-              })
-              break
-            case 200:
-            default:
-              callback(null, {
-                statusCode: 200,
-                headers: {},
-                statusMessage: '',
-                httpVersionMajor: 1,
-                httpVersionMinor: 1
-              }, {timestamp: '6487805648321904641'})
-          }
-        })
-      })
-
-      after(function () {
-        requestStub.restore()
-      })
-
-      describe('when params.useProxy is true', function () {
-        let expectedOptions
-        before(function () {
-          expectedOptions = {
-            url: 'https://ledger-proxy.privateinternetaccess.com/v3/publisher/timestamp',
-            method: 'GET',
-            payload: undefined,
-            responseType: 'text',
-            headers: {
-              'content-type': 'application/json; charset=utf-8',
-              'user-agent': ''
-            },
-            verboseP: undefined
-          }
-          requestStub.reset()
-          simpleCallback.reset()
-          ledgerApi.roundtrip({
-            server: 'https://ledger.brave.com',
-            path: '/v3/publisher/timestamp',
-            useProxy: true
-          }, {}, simpleCallback)
-        })
-
-        it('updates URL to use proxy (ledger-proxy.privateinternetaccess.com)', function () {
-          assert(requestStub.withArgs(expectedOptions, sinon.match.func).called)
-        })
-
-        it('calls the callback on success', function () {
-          assert(simpleCallback.calledOnce)
-        })
-
-        describe('when the proxy returns a 403', function () {
-          before(function () {
-            responseCode = 403
-            requestStub.reset()
-            ledgerApi.roundtrip({
-              server: 'https://ledger.brave.com',
-              path: '/v3/publisher/timestamp',
-              useProxy: true
-            }, {}, simpleCallback)
-          })
-          after(function () {
-            responseCode = 200
-          })
-          it('calls request a second time (with useProxy = false)', function () {
-            assert(requestStub.calledTwice)
-            assert(requestStub.withArgs(expectedOptions, sinon.match.func).called)
-
-            const secondCallOptions = Object.assign({}, expectedOptions, {
-              url: 'https://ledger.brave.com/v3/publisher/timestamp'
-            })
-            assert(requestStub.withArgs(secondCallOptions, sinon.match.func).called)
-          })
-        })
-      })
-    })
   })
 
   describe('when timing needs to be checked', function () {
     describe('addSiteVisit', function () {
       const fakeTabId = 7
+      const tabIdNone = -1
+      const manualAdd = true
       let stateWithLocation
+      let stateWithLocationTwo
       let fakeClock
+      let saveVisitSpy
       before(function () {
         const locationData = Immutable.fromJS({
           publisher: 'clifton.io',
           stickyP: true,
           exclude: false
         })
+        const locationDataTwo = Immutable.fromJS({
+          publisher: 'brave.com',
+          stickyP: false,
+          exclude: false
+        })
         stateWithLocation = defaultAppState.setIn(['ledger', 'locations', 'https://clifton.io/'], locationData)
+        stateWithLocationTwo = defaultAppState.setIn(['ledger', 'locations', 'https://brave.com/'], locationDataTwo)
+        saveVisitSpy = sinon.spy(ledgerApi, 'saveVisit')
       })
       beforeEach(function () {
         fakeClock = sinon.useFakeTimers()
@@ -983,6 +936,51 @@ describe('ledger api unit tests', function () {
       afterEach(function () {
         ledgerApi.setSynopsis(undefined)
         fakeClock.restore()
+        saveVisitSpy.restore()
+      })
+      it('duration is equal to the minimum visit time under a manual addition', function () {
+        const location = 'https://brave.com'
+        const state = ledgerApi.initialize(stateWithLocationTwo, true)
+
+        ledgerApi.addSiteVisit(state, 0, location, tabIdNone, manualAdd)
+        const calledDuration = saveVisitSpy.getCall(0).args[2].duration
+
+        assert.equal(paymentsMinVisitTime, calledDuration)
+      })
+      it('revisited is false under a manual addition', function () {
+        const location = 'https://brave.com'
+        const state = ledgerApi.initialize(stateWithLocationTwo, true)
+
+        ledgerApi.addSiteVisit(state, 0, location, tabIdNone, manualAdd)
+        const calledRevisited = saveVisitSpy.getCall(0).args[2].revisited
+
+        assert.equal(false, calledRevisited)
+      })
+      it('saves the visit with a valid publisherKey under a manual addition', function () {
+        const location = 'https://brave.com'
+        const expectedPublisherKey = 'brave.com'
+        const state = ledgerApi.initialize(stateWithLocationTwo, true)
+
+        ledgerApi.addSiteVisit(state, 0, location, tabIdNone, manualAdd)
+        const passedPublisherKey = saveVisitSpy.getCall(0).args[1]
+
+        assert.equal(expectedPublisherKey, passedPublisherKey)
+      })
+      it('saves the visit with a valid publisherKey under a non-manual addition', function () {
+        const location = 'https://brave.com'
+        const expectedPublisherKey = 'brave.com'
+        const state = ledgerApi.initialize(stateWithLocationTwo, true)
+
+        ledgerApi.addSiteVisit(state, 0, location, fakeTabId)
+        const passedPublisherKey = saveVisitSpy.getCall(0).args[1]
+
+        assert.equal(expectedPublisherKey, passedPublisherKey)
+      })
+      it('state is not modified on a null location under a manual addition', function () {
+        const location = null
+        const result = ledgerApi.addSiteVisit(defaultAppState, 0, location, tabIdNone, manualAdd)
+
+        assert.deepEqual(defaultAppState.toJS(), result.toJS())
       })
       it('records a visit when over the PAYMENTS_MINIMUM_VISIT_TIME threshold', function () {
         const state = ledgerApi.initialize(stateWithLocation, true)
@@ -1025,103 +1023,94 @@ describe('ledger api unit tests', function () {
         assert(visitsByPublisher['clifton.io'])
       })
     })
-
-    describe('transitionWalletToBat', function () {
-      let fakeClock
+    describe('saveVisit', function () {
+      let setPublishersPropSpy
 
       before(function () {
-        fakeClock = sinon.useFakeTimers()
-      })
-      after(function () {
-        ledgerApi.setSynopsis(undefined)
-        fakeClock.restore()
+        setPublishersPropSpy = sinon.spy(ledgerState, 'setPublishersProp')
       })
 
-      describe('when client is not busy', function () {
-        before(function () {
-          ledgerApi.onBootStateFile(defaultAppState)
-          ledgerTransitionSpy.reset()
-          onBitcoinToBatTransitionedSpy.reset()
-          onLedgerCallbackSpy.reset()
-          ledgerTransitionedSpy.reset()
-          onBitcoinToBatBeginTransitionSpy.reset()
-          ledgerClient.reset()
-          ledgerApi.resetNewClient()
-          isBusy = false
-          ledgerApi.transitionWalletToBat()
-        })
-        it('creates a new instance of ledgerClient', function () {
-          assert(ledgerClient.calledOnce)
-        })
-        it('calls AppActions.onBitcoinToBatBeginTransition', function () {
-          assert(onBitcoinToBatBeginTransitionSpy.calledOnce)
-        })
-        it('calls client.transition', function () {
-          assert(ledgerTransitionSpy.calledOnce)
-        })
-        describe('when transition completes', function () {
-          it('calls client.transitioned', function () {
-            assert(ledgerTransitionedSpy.calledOnce)
-          })
-          it('calls AppActions.onLedgerCallback', function () {
-            assert(onLedgerCallbackSpy.calledOnce)
-          })
-          it('calls AppActions.onBitcoinToBatTransitioned', function () {
-            assert(onBitcoinToBatTransitionedSpy.calledOnce)
-          })
+      beforeEach(function () {
+        ledgerApi.setSynopsis({
+          addPublisher: () => {},
+          options: {},
+          publishers: {}
         })
       })
-      describe('when client is busy', function () {
-        before(function () {
-          ledgerApi.onBootStateFile(defaultAppState)
-          ledgerTransitionSpy.reset()
-          onBitcoinToBatTransitionedSpy.reset()
-          onLedgerCallbackSpy.reset()
-          ledgerTransitionedSpy.reset()
-          onBitcoinToBatBeginTransitionSpy.reset()
-          ledgerClient.reset()
-          ledgerApi.resetNewClient()
-          isBusy = true
-          ledgerApi.transitionWalletToBat()
-        })
-        after(function () {
-          isBusy = false
-        })
-        it('does not call AppActions.onBitcoinToBatBeginTransition', function () {
-          assert(onBitcoinToBatBeginTransitionSpy.notCalled)
-        })
-        it('does not call client.transition', function () {
-          assert(ledgerTransitionSpy.notCalled)
-        })
+
+      afterEach(function () {
+        setPublishersPropSpy.reset()
+        ledgerApi.setSynopsis(undefined)
       })
-      describe('when client is not v1', function () {
-        let oldClient
-        before(function () {
-          const batState = ledgerApi.onBootStateFile(defaultAppState)
-          ledgerTransitionSpy.reset()
-          onBitcoinToBatTransitionedSpy.reset()
-          onLedgerCallbackSpy.reset()
-          ledgerTransitionedSpy.reset()
-          onBitcoinToBatBeginTransitionSpy.reset()
-          ledgerClient.reset()
-          oldClient = ledgerApi.getClient()
-          ledgerApi.setClient({
-            options: {
-              version: 'v2'
-            }
-          })
-          ledgerApi.resetNewClient()
-          ledgerApi.transitionWalletToBat(batState)
-        })
-        after(function () {
-          ledgerApi.setClient(oldClient)
-        })
-        it('calls AppActions.onBitcoinToBatTransitioned', function () {
-          assert(onBitcoinToBatTransitionedSpy.calledOnce)
-        })
-        it('does not call client.transition', function () {
-          assert(ledgerTransitionSpy.notCalled)
-        })
+
+      after(function () {
+        setPublishersPropSpy.restore()
+      })
+
+      it('sets https as protocol for secure site', function () {
+        const options = {
+          duration: 5500,
+          protocol: 'https:',
+          revisited: false
+        }
+        const result = ledgerApi.saveVisit(defaultAppState, 'brave.com', options)
+        assert.equal('https:', setPublishersPropSpy.getCall(0).args[3])
+        assert.equal('https:', result.getIn(['ledger', 'synopsis', 'publishers', 'brave.com', 'protocol']))
+      })
+
+      it('sets http as protocol for non-secure site', function () {
+        const options = {
+          duration: 5500,
+          protocol: 'http:',
+          revisited: false
+        }
+        const result = ledgerApi.saveVisit(defaultAppState, 'espn.com', options)
+        assert.equal('http:', setPublishersPropSpy.getCall(0).args[3])
+        assert.equal('http:', result.getIn(['ledger', 'synopsis', 'publishers', 'espn.com', 'protocol']))
+      })
+    })
+    describe('addNewLocation', function () {
+      const tabIdNone = -1
+      const keepInfo = false
+      const manualAdd = true
+      let addSiteVisitSpy
+      let shouldTrackTabSpy
+      before(function () {
+        addSiteVisitSpy = sinon.spy(ledgerApi, 'addSiteVisit')
+        shouldTrackTabSpy = sinon.spy(ledgerApi, 'shouldTrackTab')
+      })
+      beforeEach(function () {
+        ledgerApi.clearVisitsByPublisher()
+      })
+      after(function () {
+        addSiteVisitSpy.restore()
+        shouldTrackTabSpy.restore()
+      })
+      afterEach(function () {
+        addSiteVisitSpy.reset()
+        shouldTrackTabSpy.reset()
+        ledgerApi.setSynopsis(undefined)
+      })
+      it('does not call should track tab under a manual addition', function () {
+        const location = 'https://brave.com'
+
+        ledgerApi.addNewLocation(defaultAppState, location, tabIdNone, keepInfo, manualAdd)
+
+        assert(shouldTrackTabSpy.notCalled)
+      })
+      it('records enough visits to satisfy the minimum criteria under a manual addition', function () {
+        const location = 'https://brave.com'
+
+        ledgerApi.addNewLocation(defaultAppState, location, tabIdNone, keepInfo, manualAdd)
+
+        assert.equal(addSiteVisitSpy.callCount, paymentsMinVisits)
+      })
+      it('currentTabId is set to -1 (tabState.TAB_ID_NONE) under a manual addition', function () {
+        const location = 'https://brave.com'
+
+        ledgerApi.addNewLocation(defaultAppState, location, tabIdNone, keepInfo, manualAdd)
+
+        assert.equal(tabIdNone, addSiteVisitSpy.getCall(0).args[3])
       })
     })
   })
@@ -1148,41 +1137,55 @@ describe('ledger api unit tests', function () {
 
     it('no new transaction', function () {
       const state = defaultAppState.setIn(['ledger', 'info', 'transactions'], Immutable.fromJS([{votes: 10}]))
-      ledgerApi.observeTransactions(state, [{votes: 10}])
+      ledgerApi.observeTransactions(state, Immutable.fromJS([{votes: 10}]))
       assert(showPaymentDoneSpy.notCalled)
     })
 
     it('payment notifications are disabled', function () {
       paymentsNotifications = false
-      ledgerApi.observeTransactions(defaultAppState, [{votes: 10}])
+      ledgerApi.observeTransactions(defaultAppState, Immutable.fromJS([{votes: 10}]))
       assert(showPaymentDoneSpy.notCalled)
       paymentsNotifications = true
     })
 
     it('payment notifications are enabled, but there is no transactions', function () {
-      ledgerApi.observeTransactions(defaultAppState, [])
+      ledgerApi.observeTransactions(defaultAppState, Immutable.List())
       assert(showPaymentDoneSpy.notCalled)
     })
 
     it('transaction is corupted', function () {
-      ledgerApi.observeTransactions(defaultAppState, [{votes: 10}])
+      ledgerApi.observeTransactions(defaultAppState, Immutable.fromJS([{votes: 10}]))
       assert(showPaymentDoneSpy.notCalled)
     })
 
     it('show notification (first transaction in the array)', function () {
-      ledgerApi.observeTransactions(defaultAppState, [
+      ledgerApi.observeTransactions(defaultAppState, Immutable.fromJS([
         {
           contribution: {
-            fiat: 10
+            fiat: {
+              amount: 10,
+              currency: 'BAT'
+            },
+            probi: '100000000000000000000'
           }
         },
         {
           contribution: {
-            fiat: 30
+            fiat: {
+              amount: 30,
+              currency: 'BAT'
+            },
+            probi: '300000000000000000000'
           }
         }
-      ])
-      assert(showPaymentDoneSpy.withArgs(10).calledOnce)
+      ]))
+      assert(showPaymentDoneSpy.withArgs(Immutable.fromJS({
+        fiat: {
+          amount: 10,
+          currency: 'BAT'
+        },
+        probi: '100000000000000000000'
+      })).calledOnce)
     })
   })
 
@@ -1207,7 +1210,7 @@ describe('ledger api unit tests', function () {
       })
 
       it('null case', function () {
-        ledgerApi.onWalletProperties()
+        ledgerApi.onWalletProperties(state)
         assert(generatePaymentDataSpy.notCalled)
       })
 
@@ -1258,6 +1261,7 @@ describe('ledger api unit tests', function () {
           balance: balance.toString()
         }))
         const expectedState = state.setIn(['ledger', 'info', 'balance'], balance)
+        .setIn(['ledger', 'info', 'userHasFunded'], true)
         assert.deepEqual(result.toJS(), expectedState.toJS())
       })
     })
@@ -1422,18 +1426,19 @@ describe('ledger api unit tests', function () {
         const expectedState = state
           .setIn(['ledger', 'info', 'probi'], probi)
           .setIn(['ledger', 'info', 'balance'], 25)
+          .setIn(['ledger', 'info', 'userFunded'], 25)
+          .setIn(['ledger', 'info', 'userHasFunded'], true)
+          .setIn(['ledger', 'info', 'grants'], Immutable.List())
         assert.deepEqual(result.toJS(), expectedState.toJS())
       })
 
       it('amount is null', function () {
         const result = ledgerApi.onWalletProperties(state, Immutable.fromJS({
-          probi: probi,
           rates: rates
         }))
         const expectedState = state
           .setIn(['ledger', 'info', 'rates'], Immutable.fromJS(rates))
           .setIn(['ledger', 'info', 'currentRate'], rate)
-          .setIn(['ledger', 'info', 'probi'], probi)
         assert.deepEqual(result.toJS(), expectedState.toJS())
       })
 
@@ -1446,14 +1451,17 @@ describe('ledger api unit tests', function () {
         const expectedState = state
           .setIn(['ledger', 'info', 'rates'], Immutable.fromJS(rates))
           .setIn(['ledger', 'info', 'currentRate'], rate)
-          .setIn(['ledger', 'info', 'converted'], '3.58')
+          .setIn(['ledger', 'info', 'converted'], 3.5836474125)
           .setIn(['ledger', 'info', 'balance'], 25)
+          .setIn(['ledger', 'info', 'userFunded'], 25)
           .setIn(['ledger', 'info', 'probi'], probi)
+          .setIn(['ledger', 'info', 'userHasFunded'], true)
+          .setIn(['ledger', 'info', 'grants'], Immutable.List())
         assert.deepEqual(result.toJS(), expectedState.toJS())
       })
 
       it('big probi', function () {
-        const bigProbi = '7.309622404968674704085e+21'
+        const bigProbi = 7.309622404968674704085e+21
         const result = ledgerApi.onWalletProperties(state, Immutable.fromJS({
           probi: bigProbi,
           balance: '7309.6224',
@@ -1462,9 +1470,12 @@ describe('ledger api unit tests', function () {
         const expectedState = state
           .setIn(['ledger', 'info', 'rates'], Immutable.fromJS(rates))
           .setIn(['ledger', 'info', 'currentRate'], rate)
-          .setIn(['ledger', 'info', 'converted'], '1047.80')
+          .setIn(['ledger', 'info', 'converted'], 1047.8043767167208)
           .setIn(['ledger', 'info', 'balance'], 7309.6224)
+          .setIn(['ledger', 'info', 'userFunded'], 7309.622404968675)
           .setIn(['ledger', 'info', 'probi'], bigProbi)
+          .setIn(['ledger', 'info', 'userHasFunded'], true)
+          .setIn(['ledger', 'info', 'grants'], Immutable.List())
         assert.deepEqual(result.toJS(), expectedState.toJS())
       })
     })
@@ -1557,6 +1568,81 @@ describe('ledger api unit tests', function () {
         contributionAmount = 10
       })
     })
+
+    describe('grants', function () {
+      const probi = 25000000000000000000
+
+      it('probi is missing', function () {
+        const expectedState = state
+          .setIn(['ledger', 'info', 'balance'], 25)
+          .setIn(['ledger', 'info', 'userHasFunded'], true)
+        const result = ledgerApi.onWalletProperties(state, Immutable.fromJS({
+          balance: 25
+        }))
+        assert.deepEqual(result.toJS(), expectedState.toJS())
+      })
+
+      it('is missing', function () {
+        const expectedState = state
+          .setIn(['ledger', 'info', 'balance'], 25)
+          .setIn(['ledger', 'info', 'userHasFunded'], true)
+          .setIn(['ledger', 'info', 'probi'], probi)
+          .setIn(['ledger', 'info', 'userFunded'], 25)
+          .setIn(['ledger', 'info', 'grants'], Immutable.List())
+        const result = ledgerApi.onWalletProperties(state, Immutable.fromJS({
+          probi,
+          balance: 25
+        }))
+        assert.deepEqual(result.toJS(), expectedState.toJS())
+      })
+
+      it('grant is saved', function () {
+        const expectedState = state
+          .setIn(['ledger', 'info', 'balance'], 25)
+          .setIn(['ledger', 'info', 'userHasFunded'], true)
+          .setIn(['ledger', 'info', 'probi'], probi)
+          .setIn(['ledger', 'info', 'userFunded'], 15)
+          .setIn(['ledger', 'info', 'grants'], Immutable.fromJS([{
+            expirationDate: 2130600234,
+            amount: 10
+          }]))
+        const result = ledgerApi.onWalletProperties(state, Immutable.fromJS({
+          probi,
+          balance: 25,
+          grants: [{
+            altcurrency: 'BAT',
+            expiryTime: 2130600234,
+            probi: 10000000000000000000
+          }]
+        }))
+        assert.deepEqual(result.toJS(), expectedState.toJS())
+      })
+
+      it('grant is reset when claimed', function () {
+        const newState = state
+          .setIn(['ledger', 'info', 'balance'], 25)
+          .setIn(['ledger', 'info', 'userHasFunded'], true)
+          .setIn(['ledger', 'info', 'probi'], probi)
+          .setIn(['ledger', 'info', 'userFunded'], 15)
+          .setIn(['ledger', 'info', 'grants'], Immutable.fromJS([{
+            expirationDate: 2130600234,
+            amount: 10
+          }]))
+
+        const result = ledgerApi.onWalletProperties(newState, Immutable.fromJS({
+          probi,
+          balance: 25,
+          grants: []
+        }))
+        const expectedState = state
+          .setIn(['ledger', 'info', 'balance'], 25)
+          .setIn(['ledger', 'info', 'userHasFunded'], true)
+          .setIn(['ledger', 'info', 'probi'], probi)
+          .setIn(['ledger', 'info', 'userFunded'], 25)
+          .setIn(['ledger', 'info', 'grants'], Immutable.List())
+        assert.deepEqual(result.toJS(), expectedState.toJS())
+      })
+    })
   })
 
   describe('claimPromotion', function () {
@@ -1564,6 +1650,7 @@ describe('ledger api unit tests', function () {
       .setIn(['ledger', 'promotion', 'promotionId'], '1')
 
     before(function () {
+      ledgerApi.setClient(ledgerClientObject)
       ledgersetPromotionSpy.reset()
     })
 
@@ -1586,7 +1673,12 @@ describe('ledger api unit tests', function () {
 
     it('execute', function () {
       ledgerApi.claimPromotion(state)
-      assert(ledgersetPromotionSpy.calledOnce)
+      assert(ledgersetPromotionSpy.withArgs('1', {x: undefined, y: undefined}, sinon.match.any).calledOnce)
+    })
+
+    it('execute with coordinates', function () {
+      ledgerApi.claimPromotion(state, 5, 6)
+      assert(ledgersetPromotionSpy.withArgs('1', {x: 5, y: 6}, sinon.match.any).calledOnce)
     })
   })
 
@@ -1680,6 +1772,62 @@ describe('ledger api unit tests', function () {
       ledgerApi.onPromotionResponse(state)
       assert(ledgerSetTimeUntilReconcile.notCalled)
     })
+
+    describe('status', function () {
+      let getCaptchaSpy
+
+      before(function () {
+        getCaptchaSpy = sinon.spy(ledgerApi, 'getCaptcha')
+      })
+
+      afterEach(function () {
+        getCaptchaSpy.reset()
+      })
+
+      after(function () {
+        getCaptchaSpy.restore()
+      })
+
+      it('promotion expired', function () {
+        const result = ledgerApi.onPromotionResponse(defaultAppState, Immutable.fromJS({
+          statusCode: 422
+        }))
+        const expectedSate = defaultAppState
+          .setIn(['ledger', 'promotion', 'promotionStatus'], promotionStatuses.PROMO_EXPIRED)
+        assert.deepEqual(result.toJS(), expectedSate.toJS())
+        assert(getCaptchaSpy.notCalled)
+      })
+
+      it('captcha error', function () {
+        const result = ledgerApi.onPromotionResponse(defaultAppState, Immutable.fromJS({
+          statusCode: 403
+        }))
+        const expectedSate = defaultAppState
+          .setIn(['ledger', 'promotion', 'promotionStatus'], promotionStatuses.CAPTCHA_ERROR)
+        assert.deepEqual(result.toJS(), expectedSate.toJS())
+        assert(getCaptchaSpy.calledOnce)
+      })
+
+      it('general error', function () {
+        const result = ledgerApi.onPromotionResponse(defaultAppState, Immutable.fromJS({
+          statusCode: 500
+        }))
+        const expectedSate = defaultAppState
+          .setIn(['ledger', 'promotion', 'promotionStatus'], promotionStatuses.GENERAL_ERROR)
+        assert.deepEqual(result.toJS(), expectedSate.toJS())
+        assert(getCaptchaSpy.notCalled)
+      })
+
+      it('block error', function () {
+        const result = ledgerApi.onPromotionResponse(defaultAppState, Immutable.fromJS({
+          statusCode: 429
+        }))
+        const expectedSate = defaultAppState
+          .setIn(['ledger', 'promotion', 'promotionStatus'], promotionStatuses.CAPTCHA_BLOCK)
+        assert.deepEqual(result.toJS(), expectedSate.toJS())
+        assert(getCaptchaSpy.notCalled)
+      })
+    })
   })
 
   describe('onWalletRecovery', function () {
@@ -1731,9 +1879,13 @@ describe('ledger api unit tests', function () {
         }
       }
     })
+    const stateWithAbout = defaultAppState
+      .set('about', Immutable.fromJS({
+        preferences: {}
+      }))
 
     before(function () {
-      setRecoveryStatusSpy = sinon.spy(ledgerState, 'setRecoveryStatus')
+      setRecoveryStatusSpy = sinon.spy(aboutPreferencesState, 'setRecoveryStatus')
       getBalanceSpy = sinon.spy(ledgerApi, 'getBalance')
       onLedgerCallbackSpy.reset()
       fakeClock = sinon.useFakeTimers()
@@ -1753,10 +1905,11 @@ describe('ledger api unit tests', function () {
     })
 
     it('on error', function () {
-      const result = ledgerApi.onWalletRecovery(defaultAppState, 'Wrong key')
+      const result = ledgerApi.onWalletRecovery(stateWithAbout, 'Wrong key')
       const expectedSate = defaultAppState
         .set('about', Immutable.fromJS({
           preferences: {
+            recoveryInProgress: false,
             recoverySucceeded: false,
             updatedStamp: 0
           }
@@ -1770,10 +1923,11 @@ describe('ledger api unit tests', function () {
     })
 
     it('success', function () {
-      const result = ledgerApi.onWalletRecovery(defaultAppState, null, param)
+      const result = ledgerApi.onWalletRecovery(stateWithAbout, null, param)
       const expectedSate = defaultAppState
         .set('about', Immutable.fromJS({
           preferences: {
+            recoveryInProgress: false,
             recoverySucceeded: true,
             updatedStamp: 0
           }
@@ -1939,62 +2093,282 @@ describe('ledger api unit tests', function () {
           }))
         assert.deepEqual(result.toJS(), expectedState.toJS())
       })
-    })
-  })
 
-  describe('onPublisherTimestamp', function () {
-    let checkVerifiedStatusSpy
+      it('seed is broken', function () {
+        const wrongSeed = Immutable
+          .fromJS(seedData)
+          .setIn(['properties', 'wallet', 'keyinfo', 'seed'], Buffer.from([0, 0]))
+          .toJS()
 
-    const stateWithData = defaultAppState
-      .setIn(['ledger', 'synopsis', 'publishers', 'clifton.io'], Immutable.fromJS({
-        visits: 1
-      }))
+        walletPassphraseReturn = 'error'
 
-    before(function () {
-      checkVerifiedStatusSpy = sinon.spy(ledgerApi, 'checkVerifiedStatus')
-      ledgerApi.setClient({
-        publisherInfo: function () {
-          return false
-        },
-        publishersInfo: function () {
-          return false
-        }
+        const result = ledgerApi.getStateInfo(defaultAppState, wrongSeed)
+        const expectedState = defaultAppState
+          .setIn(['ledger', 'info'], Immutable.fromJS({
+            'created': true,
+            'creating': false,
+            'paymentId': '21951877-5998-4acf-9302-4a7b101c9188',
+            'reconcileFrequency': 30,
+            'reconcileStamp': 1
+          }))
+          .setIn(['ledger', 'about', 'status'], ledgerStatuses.CORRUPTED_SEED)
+
+        assert.deepEqual(result.toJS(), expectedState.toJS())
+        assert(getWalletPassphraseSpy.withArgs(wrongSeed).calledOnce)
       })
     })
 
-    afterEach(function () {
-      checkVerifiedStatusSpy.reset()
-    })
+    describe('transactions', function () {
+      let setInfoPropSpy, getInfoPropSpy
 
-    after(function () {
-      checkVerifiedStatusSpy.restore()
-      ledgerApi.setClient(undefined)
-    })
+      before(function () {
+        setInfoPropSpy = sinon.spy(ledgerState, 'setInfoProp')
+        getInfoPropSpy = sinon.spy(ledgerState, 'getInfoProp')
+      })
 
-    it('publisher timestamp is the same', function () {
-      ledgerApi.onPublisherTimestamp(defaultAppState, 10, 10)
-      assert(checkVerifiedStatusSpy.notCalled)
-    })
+      afterEach(function () {
+        setInfoPropSpy.reset()
+        getInfoPropSpy.reset()
+      })
 
-    it('publisher list is empty', function () {
-      ledgerApi.onPublisherTimestamp(defaultAppState, 10, 20)
-      assert(checkVerifiedStatusSpy.notCalled)
-    })
+      after(function () {
+        setInfoPropSpy.restore()
+        getInfoPropSpy.restore()
+        ledgerApi.setClient(undefined)
+      })
 
-    it('check publishers', function () {
-      ledgerApi.onPublisherTimestamp(stateWithData, 10, 20)
-      assert(checkVerifiedStatusSpy.withArgs(sinon.match.any, 'clifton.io', 20).calledOnce)
-    })
+      it('transactions are missing', function () {
+        ledgerApi.getStateInfo(defaultAppState, Immutable.Map())
+        assert(getInfoPropSpy.notCalled)
+        assert(setInfoPropSpy.notCalled)
+      })
 
-    it('check multiple publishers', function () {
-      const multiple = stateWithData
-        .setIn(['ledger', 'synopsis', 'publishers', 'brave.com'], Immutable.fromJS({
-          visits: 1
-        }))
-      ledgerApi.onPublisherTimestamp(multiple, 10, 20)
+      it('no new transactions', function () {
+        const transactions = [{
+          viewingId: 1,
+          votes: 44,
+          ballots: {
+            'site1.com': 10,
+            'site2.com': 18,
+            'site3.com': 9,
+            'site4.com': 7
+          }
+        }]
+        const param = {
+          properties: {
+            wallet: {
+              paymentId: '1'
+            }
+          },
+          transactions
+        }
+        const state = defaultAppState
+          .setIn(['ledger', 'info', 'transactions'], Immutable.fromJS(transactions))
 
-      assert.equal(checkVerifiedStatusSpy.getCall(0).args[1], 'clifton.io')
-      assert.equal(checkVerifiedStatusSpy.getCall(1).args[1], 'brave.com')
+        ledgerApi.getStateInfo(state, param)
+        assert(getInfoPropSpy.calledOnce)
+        assert(setInfoPropSpy.notCalled)
+      })
+
+      it('transaction is still in progress', function () {
+        const param = {
+          properties: {
+            wallet: {
+              paymentId: '1'
+            }
+          },
+          transactions: [{
+            viewingId: 1,
+            votes: 44,
+            ballots: {
+              'site1.com': 10,
+              'site2.com': 18
+            }
+          }]
+        }
+        const state = defaultAppState
+          .setIn(['ledger', 'info', 'transactions'], Immutable.List())
+
+        ledgerApi.getStateInfo(state, param)
+        assert(getInfoPropSpy.calledOnce)
+        assert(setInfoPropSpy.notCalled)
+      })
+
+      it('new transaction is completed', function () {
+        const param = {
+          properties: {
+            wallet: {
+              paymentId: '1'
+            }
+          },
+          transactions: [{
+            viewingId: 1,
+            votes: 44,
+            ballots: {
+              'site1.com': 10,
+              'site2.com': 18,
+              'site3.com': 9,
+              'site4.com': 7
+            }
+          }]
+        }
+        const state = defaultAppState
+          .setIn(['ledger', 'info', 'transactions'], Immutable.List())
+
+        ledgerApi.getStateInfo(state, param)
+        assert(getInfoPropSpy.called)
+        assert(setInfoPropSpy.calledOnce)
+      })
+
+      it('old transaction is merged with the new one', function () {
+        const param = {
+          properties: {
+            wallet: {
+              paymentId: '1'
+            }
+          },
+          transactions: [
+            {
+              viewingId: 1,
+              votes: 44,
+              ballots: {
+                'site1.com': 10,
+                'site2.com': 18,
+                'site3.com': 9,
+                'site4.com': 7
+              }
+            },
+            {
+              viewingId: 2,
+              votes: 28,
+              ballots: {
+                'site1.com': 10,
+                'site2.com': 18
+              }
+            },
+            {
+              viewingId: 3,
+              votes: 35,
+              ballots: {
+                'site1.com': 10,
+                'site2.com': 18,
+                'site4.com': 7
+              }
+            }
+          ]
+        }
+        const state = defaultAppState
+          .setIn(['ledger', 'synopsis', 'publishers'], Immutable.fromJS({
+            'site1.com': {
+              faviconName: 'site1',
+              providerName: 'YouTube'
+            },
+            'site2.com': {
+              faviconName: 'site2',
+              providerName: 'YouTube'
+            },
+            'site3.com': {
+              faviconName: 'site3',
+              providerName: 'Twitch'
+            },
+            'site4.com': {}
+          }))
+          .setIn(['ledger', 'info', 'transactions'], Immutable.fromJS([
+            {
+              viewingId: 2,
+              votes: 28,
+              ballots: {
+                'site1.com': 10,
+                'site2.com': 18
+              },
+              names: {
+                'site1.com': 'PUBLISHERMEDIANAME, publisherName/site1, provider/YouTube',
+                'site2.com': 'PUBLISHERMEDIANAME, publisherName/site2, provider/YouTube'
+              }
+            },
+            {
+              viewingId: 1,
+              votes: 44,
+              ballots: {
+                'site1.com': 10,
+                'site2.com': 18,
+                'site3.com': 9,
+                'site4.com': 7
+              }
+            }
+          ]))
+
+        const expectedState = defaultAppState
+          .setIn(['ledger', 'synopsis', 'publishers'], Immutable.fromJS({
+            'site1.com': {
+              faviconName: 'site1',
+              providerName: 'YouTube'
+            },
+            'site2.com': {
+              faviconName: 'site2',
+              providerName: 'YouTube'
+            },
+            'site3.com': {
+              faviconName: 'site3',
+              providerName: 'Twitch'
+            },
+            'site4.com': {}
+          }))
+          .setIn(['ledger', 'info'], Immutable.fromJS({
+            created: true,
+            creating: false,
+            paymentId: '1',
+            reconcileFrequency: undefined,
+            reconcileStamp: undefined
+          }))
+          .setIn(['ledger', 'info', 'transactions'], Immutable.fromJS([
+            {
+              viewingId: 3,
+              votes: 35,
+              ballots: {
+                'site1.com': 10,
+                'site2.com': 18,
+                'site4.com': 7
+              },
+              names: {
+                'site1.com': 'PUBLISHERMEDIANAME, publisherName/site1, provider/YouTube',
+                'site2.com': 'PUBLISHERMEDIANAME, publisherName/site2, provider/YouTube'
+              }
+            },
+            {
+              viewingId: 2,
+              votes: 28,
+              ballots: {
+                'site1.com': 10,
+                'site2.com': 18
+              },
+              names: {
+                'site1.com': 'PUBLISHERMEDIANAME, publisherName/site1, provider/YouTube',
+                'site2.com': 'PUBLISHERMEDIANAME, publisherName/site2, provider/YouTube'
+              }
+            },
+            {
+              viewingId: 1,
+              votes: 44,
+              ballots: {
+                'site1.com': 10,
+                'site2.com': 18,
+                'site3.com': 9,
+                'site4.com': 7
+              },
+              names: {
+                'site1.com': 'PUBLISHERMEDIANAME, publisherName/site1, provider/YouTube',
+                'site2.com': 'PUBLISHERMEDIANAME, publisherName/site2, provider/YouTube',
+                'site3.com': 'PUBLISHERMEDIANAME, publisherName/site3, provider/Twitch'
+              }
+            }
+          ]))
+
+        const result = ledgerApi.getStateInfo(state, param)
+        assert(getInfoPropSpy.called)
+        assert(setInfoPropSpy.calledOnce)
+        assert.deepEqual(result.toJS(), expectedState.toJS())
+      })
     })
   })
 
@@ -2065,6 +2439,85 @@ describe('ledger api unit tests', function () {
         assert.deepEqual(result.toJS(), expectedState.toJS())
       })
     })
+
+    describe('status', function () {
+      it('null case', function () {
+        const result = ledgerApi.onCallback(defaultAppState, null)
+        assert.deepEqual(result.toJS(), defaultAppState.toJS())
+      })
+
+      it('reconcile is not in progress', function () {
+        const result = ledgerApi.onCallback(defaultAppState, Immutable.fromJS({
+          properties: {}
+        }))
+        assert.deepEqual(result.toJS(), defaultAppState.toJS())
+      })
+
+      it('reconcile is in progress (first time)', function () {
+        const result = ledgerApi.onCallback(defaultAppState, Immutable.fromJS({
+          currentReconcile: {
+            timestamp: 0
+          }
+        }))
+        const expectedState = defaultAppState
+          .setIn(['ledger', 'about', 'status'], ledgerStatuses.IN_PROGRESS)
+        assert.deepEqual(result.toJS(), expectedState.toJS())
+      })
+
+      it('reconcile is in progress (second time)', function () {
+        const result = ledgerApi.onCallback(defaultAppState, Immutable.fromJS({
+          currentReconcile: {
+            timestamp: 1
+          }
+        }))
+        assert.deepEqual(result.toJS(), defaultAppState.toJS())
+      })
+    })
+
+    describe('contribution', function () {
+      let getPaymentInfoSpy
+
+      before(function () {
+        getPaymentInfoSpy = sinon.spy(ledgerApi, 'getPaymentInfo')
+      })
+
+      afterEach(function () {
+        getPaymentInfoSpy.reset()
+      })
+
+      after(function () {
+        getPaymentInfoSpy.restore()
+      })
+
+      it('do not call if in progress', function () {
+        const state = defaultAppState
+          .setIn(['ledger', 'about', 'status'], ledgerStatuses.IN_PROGRESS)
+
+        ledgerApi.onCallback(state, Immutable.fromJS({
+          properties: {
+            wallet: {
+              paymentId: '1'
+            }
+          }
+        }))
+
+        assert(getPaymentInfoSpy.notCalled)
+      })
+
+      it('execute', function () {
+        ledgerApi.setClient(ledgerClientObject)
+        ledgerApi.onCallback(defaultAppState, Immutable.fromJS({
+          properties: {
+            wallet: {
+              paymentId: '1'
+            }
+          }
+        }))
+        ledgerApi.setClient(undefined)
+
+        assert(getPaymentInfoSpy.calledOnce)
+      })
+    })
   })
 
   describe('uintKeySeed', function () {
@@ -2103,6 +2556,41 @@ describe('ledger api unit tests', function () {
       173
     ])
 
+    const object = {
+      0: 32,
+      1: 87,
+      2: 30,
+      3: 26,
+      4: 223,
+      5: 56,
+      6: 224,
+      7: 31,
+      8: 213,
+      9: 136,
+      10: 248,
+      11: 95,
+      12: 136,
+      13: 56,
+      14: 250,
+      15: 78,
+      16: 179,
+      17: 121,
+      18: 255,
+      19: 162,
+      20: 195,
+      21: 39,
+      22: 143,
+      23: 136,
+      24: 18,
+      25: 140,
+      26: 49,
+      27: 216,
+      28: 221,
+      29: 154,
+      30: 78,
+      31: 173
+    }
+
     const uint = new Uint8Array(Object.values(buff))
 
     it('null case', function () {
@@ -2115,8 +2603,13 @@ describe('ledger api unit tests', function () {
       assert.deepStrictEqual(result, uint)
     })
 
-    it('seed needs to be converted', function () {
+    it('seed needs to be converted (buffer)', function () {
       const result = ledgerApi.uintKeySeed(buff)
+      assert.deepStrictEqual(result, uint)
+    })
+
+    it('seed needs to be converted (object)', function () {
+      const result = ledgerApi.uintKeySeed(object)
       assert.deepStrictEqual(result, uint)
     })
   })
@@ -2152,6 +2645,126 @@ describe('ledger api unit tests', function () {
         const result = ledgerApi.loadKeysFromBackupFile(undefined, 'file.txt')
         assert.equal(result.recoveryKey, 'a b d e f g h i j k l m n o p q')
       })
+    })
+  })
+
+  describe('fileRecoveryKeys', function () {
+    let stub
+    let setRecoveryInProgressSpy
+
+    before(function () {
+      setRecoveryInProgressSpy = sinon.spy(aboutPreferencesState, 'setRecoveryInProgress')
+    })
+
+    after(function () {
+      stub.restore()
+      setRecoveryInProgressSpy.restore()
+    })
+
+    it('does not modify state if there is no recovery key file', function () {
+      const result = ledgerApi.fileRecoveryKeys(defaultAppState, false)
+      assert.deepEqual(result, defaultAppState)
+    })
+
+    it('sets recovery in progress when a recovery key file is received', function () {
+      ledgerApi.setClient(ledgerClientObject)
+      stub = sinon.stub(fs, 'readFileSync', (path, options) => {
+        return 'Fake file key...'
+      })
+      const stateWithPreferences = defaultAppState
+        .setIn(['about'], Immutable.fromJS({
+          preferences: {}
+        }))
+      ledgerApi.fileRecoveryKeys(stateWithPreferences, 'file.txt')
+      assert.equal(stateWithPreferences, setRecoveryInProgressSpy.getCall(0).args[0])
+      assert.equal(true, setRecoveryInProgressSpy.getCall(0).args[1])
+    })
+  })
+
+  describe('recoverKeys', function () {
+    it('sets recoveryBalanceRecalculated to false when a recovery is started', function () {
+      ledgerApi.setClient(ledgerClientObject)
+      const state = ledgerApi.recoverKeys(defaultAppState
+        .setIn(['about'], Immutable.fromJS({
+          preferences: {}
+        })), false, 'fakeKey')
+      assert.equal(aboutPreferencesState.getPreferencesProp(state, 'recoveryBalanceRecalculated'), false)
+    })
+
+    it('set recoveryBalanceRecalculated to true when balance has been retrieved', function () {
+      const state = ledgerApi.onWalletProperties(defaultAppState
+        .setIn(['about'], Immutable.fromJS({
+          preferences: {
+            recoveryBalanceRecalculated: true
+          }
+        })))
+      assert.equal(aboutPreferencesState.getPreferencesProp(state, 'recoveryBalanceRecalculated'), true)
+    })
+
+    it('skips over setting recoveryBalanceRecalculated if it hasnt been set', function () {
+      const state = ledgerApi.onWalletProperties(defaultAppState
+        .setIn(['about'], Immutable.fromJS({
+          preferences: {}
+        })))
+      assert.equal(aboutPreferencesState.getPreferencesProp(state, 'recoveryBalanceRecalculated'), null)
+    })
+  })
+
+  describe('schedulePromoRefFetch', function () {
+    let onPromoRefFetchSpy
+
+    before(function () {
+      onPromoRefFetchSpy = sinon.spy(appActions, 'onPromoRefFetch')
+    })
+
+    after(function () {
+      onPromoRefFetchSpy.restore()
+    })
+
+    afterEach(function () {
+      onPromoRefFetchSpy.reset()
+    })
+
+    it('dispatches onPromoRefFetch', function () {
+      ledgerApi.schedulePromoRefFetch(defaultAppState)
+      assert(onPromoRefFetchSpy.calledOnce)
+    })
+  })
+
+  describe('onRunPromoRefFetch', function () {
+    let fakeRoundtrip, firstRunPromoCodeSpy, fetchReferralHeadersSpy
+
+    before(function () {
+      fakeRoundtrip = sinon.stub(ledgerApi, 'roundtrip')
+      firstRunPromoCodeSpy = sinon.spy(ledgerApi, 'firstRunPromoCode')
+      fetchReferralHeadersSpy = sinon.spy(ledgerApi, 'fetchReferralHeaders')
+    })
+
+    after(function () {
+      fakeRoundtrip.restore()
+      firstRunPromoCodeSpy.restore()
+      fetchReferralHeadersSpy.restore()
+    })
+
+    afterEach(function () {
+      fakeRoundtrip.reset()
+      firstRunPromoCodeSpy.reset()
+      fetchReferralHeadersSpy.reset()
+    })
+
+    it('calls firstRunPromoCode when download id is null', function () {
+      const state = defaultAppState
+        .setIn(['updates', 'referralDownloadId'], null)
+      ledgerApi.onRunPromoRefFetch(state)
+      assert(firstRunPromoCodeSpy.calledOnce)
+    })
+
+    it('does not call firstRunPromoCode and delays fetchReferralHeaders when download id exists', function () {
+      const state = defaultAppState
+        .setIn(['updates', 'referralDownloadId'], 9999)
+      ledgerApi.onRunPromoRefFetch(state)
+      assert(firstRunPromoCodeSpy.notCalled)
+      assert(fetchReferralHeadersSpy.calledOnce)
     })
   })
 
@@ -2342,16 +2955,6 @@ describe('ledger api unit tests', function () {
       roundtripSpy.restore()
     })
 
-    it('null case', function () {
-      ledgerApi.onReferralCodeRead()
-      assert(roundtripSpy.notCalled)
-    })
-
-    it('code is empty', function () {
-      ledgerApi.onReferralCodeRead('')
-      assert(roundtripSpy.notCalled)
-    })
-
     it('code is correct', function () {
       ledgerApi.onReferralCodeRead('aaa101')
       assert(roundtripSpy.calledOnce)
@@ -2396,6 +2999,1577 @@ describe('ledger api unit tests', function () {
       const returnedState = ledgerApi.referralCheck(state)
       assert.deepEqual(returnedState.toJS(), expectedState.toJS())
       assert(deleteUpdatePropSpy.calledOnce)
+    })
+  })
+
+  describe('setPublishersOptions', function () {
+    let savePublisherOptionSpy
+
+    before(function () {
+      savePublisherOptionSpy = sinon.spy(ledgerApi, 'savePublisherOption')
+    })
+
+    afterEach(function () {
+      savePublisherOptionSpy.reset()
+    })
+
+    after(function () {
+      savePublisherOptionSpy.restore()
+    })
+
+    it('null case', function () {
+      const result = ledgerApi.setPublishersOptions(defaultAppState)
+      assert(savePublisherOptionSpy.notCalled)
+      assert.deepEqual(result.toJS(), defaultAppState.toJS())
+    })
+
+    it('publisher list is empty', function () {
+      const result = ledgerApi.setPublishersOptions(defaultAppState, Immutable.List())
+      assert(savePublisherOptionSpy.notCalled)
+      assert.deepEqual(result.toJS(), defaultAppState.toJS())
+    })
+
+    it('publisher is missing publisherKey', function () {
+      const result = ledgerApi.setPublishersOptions(defaultAppState, Immutable.fromJS([
+        {
+          verified: true
+        }
+      ]))
+      assert(savePublisherOptionSpy.notCalled)
+      assert.deepEqual(result.toJS(), defaultAppState.toJS())
+    })
+
+    it('publisher list is ok', function () {
+      const result = ledgerApi.setPublishersOptions(defaultAppState, Immutable.fromJS([
+        {
+          publisherKey: 'clifton.io',
+          verified: true
+        },
+        {
+          publisherKey: 'brianbondy.com',
+          verified: false
+        }
+      ]))
+      const expectedState = defaultAppState
+        .setIn(['ledger', 'synopsis', 'publishers'], Immutable.fromJS({
+          'clifton.io': {
+            options: {
+              verified: true
+            }
+          },
+          'brianbondy.com': {
+            options: {
+              verified: false
+            }
+          }
+        }))
+
+      assert(savePublisherOptionSpy.withArgs('clifton.io', 'verified', true).calledOnce)
+      assert(savePublisherOptionSpy.withArgs('brianbondy.com', 'verified', false).calledOnce)
+      assert.deepEqual(result.toJS(), expectedState.toJS())
+    })
+  })
+
+  describe('onFavIconReceived', function () {
+    let savePublisherDataSpy, setPublishersPropSpy
+    const publisherKey = 'clifton.io'
+    const icon = 'blob'
+
+    before(function () {
+      savePublisherDataSpy = sinon.spy(ledgerApi, 'savePublisherData')
+      setPublishersPropSpy = sinon.spy(ledgerState, 'setPublishersProp')
+    })
+
+    afterEach(function () {
+      savePublisherDataSpy.reset()
+      setPublishersPropSpy.reset()
+    })
+
+    after(function () {
+      savePublisherDataSpy.restore()
+      setPublishersPropSpy.restore()
+    })
+
+    it('null case', function () {
+      const result = ledgerApi.onFavIconReceived(defaultAppState)
+      assert(savePublisherDataSpy.notCalled)
+      assert(setPublishersPropSpy.notCalled)
+      assert.deepEqual(result.toJS(), defaultAppState.toJS())
+    })
+
+    it('icon is saved', function () {
+      const expectedSate = defaultAppState
+        .setIn(['ledger', 'synopsis', 'publishers', publisherKey, 'faviconURL'], icon)
+      const result = ledgerApi.onFavIconReceived(defaultAppState, publisherKey, icon)
+      assert(setPublishersPropSpy.withArgs(sinon.match.any, publisherKey, 'faviconURL', icon).calledOnce)
+      assert(savePublisherDataSpy.calledOnce)
+      assert.deepEqual(result.toJS(), expectedSate.toJS())
+    })
+  })
+
+  describe('savePublisherOption', function () {
+    const expectedSynopsis = {
+      options: {},
+      publishers: {
+        'clifton.io': {
+          options: {
+            excluded: true
+          }
+        }
+      }
+    }
+
+    after(() => {
+      ledgerApi.setSynopsis(undefined)
+    })
+
+    it('null case', function () {
+      ledgerApi.setSynopsis(undefined)
+      ledgerApi.savePublisherOption()
+      assert.equal(ledgerApi.getSynopsis(), undefined)
+    })
+
+    it('publishers object is missing', function () {
+      ledgerApi.setSynopsis({
+        options: {}
+      })
+      ledgerApi.savePublisherOption('clifton.io', 'excluded', true)
+      assert.deepEqual(ledgerApi.getSynopsis(), {
+        options: {}
+      })
+    })
+
+    it('publisher is missing in the synopsis', function () {
+      ledgerApi.setSynopsis({
+        options: {},
+        publishers: {}
+      })
+      ledgerApi.savePublisherOption('clifton.io', 'excluded', true)
+      assert.deepEqual(ledgerApi.getSynopsis(), expectedSynopsis)
+    })
+
+    it('options is missing in the synopsis', function () {
+      ledgerApi.setSynopsis({
+        options: {},
+        publishers: {
+          'clifton.io': {}
+        }
+      })
+      ledgerApi.savePublisherOption('clifton.io', 'excluded', true)
+      assert.deepEqual(ledgerApi.getSynopsis(), expectedSynopsis)
+    })
+
+    it('option already exists', function () {
+      ledgerApi.setSynopsis({
+        options: {},
+        publishers: {
+          'clifton.io': {
+            options: {
+              excluded: false
+            }
+          }
+        }
+      })
+      ledgerApi.savePublisherOption('clifton.io', 'excluded', true)
+      assert.deepEqual(ledgerApi.getSynopsis(), expectedSynopsis)
+    })
+  })
+
+  describe('savePublisherData', function () {
+    const expectedSynopsis = {
+      options: {},
+      publishers: {
+        'clifton.io': {
+          faviconURL: 'data'
+        }
+      }
+    }
+
+    after(() => {
+      ledgerApi.setSynopsis(undefined)
+    })
+
+    it('null case', function () {
+      ledgerApi.setSynopsis(undefined)
+      ledgerApi.savePublisherData()
+      assert.equal(ledgerApi.getSynopsis(), undefined)
+    })
+
+    it('publishers object is missing', function () {
+      ledgerApi.setSynopsis({
+        options: {}
+      })
+      ledgerApi.savePublisherData('clifton.io', 'faviconURL', 'data')
+      assert.deepEqual(ledgerApi.getSynopsis(), {
+        options: {}
+      })
+    })
+
+    it('publisher is missing in the synopsis', function () {
+      ledgerApi.setSynopsis({
+        options: {},
+        publishers: {}
+      })
+      ledgerApi.savePublisherData('clifton.io', 'faviconURL', 'data')
+      assert.deepEqual(ledgerApi.getSynopsis(), expectedSynopsis)
+    })
+
+    it('publisher already exists', function () {
+      ledgerApi.setSynopsis({
+        options: {},
+        publishers: {
+          'clifton.io': {
+            faviconURL: 'oldData'
+          }
+        }
+      })
+      ledgerApi.savePublisherData('clifton.io', 'faviconURL', 'data')
+      assert.deepEqual(ledgerApi.getSynopsis(), expectedSynopsis)
+    })
+  })
+
+  describe('roundTripFromWindow', function () {
+    let fetchPublisherInfoSpy
+
+    before(() => {
+      fetchPublisherInfoSpy = sinon.spy(request, 'fetchPublisherInfo')
+    })
+
+    afterEach(() => {
+      fetchPublisherInfoSpy.reset()
+    })
+
+    after(() => {
+      fetchPublisherInfoSpy.restore()
+    })
+
+    it('null case', function () {
+      ledgerApi.roundTripFromWindow()
+      assert(fetchPublisherInfoSpy.notCalled)
+    })
+
+    it('url is missing', function () {
+      ledgerApi.roundTripFromWindow({})
+      assert(fetchPublisherInfoSpy.notCalled)
+    })
+
+    it('fetch is called', function () {
+      ledgerApi.roundTripFromWindow({url: 'test.com'}, () => true)
+      assert(fetchPublisherInfoSpy.withArgs('test.com', sinon.match.any, sinon.match.any))
+    })
+  })
+
+  describe('run', function () {
+    describe('ballots', function () {
+      let clientBallotsSpy
+
+      before(() => {
+        ledgerApi.setSynopsis({
+          toJSON: () => {
+            return {
+              publishers: {
+                'clifton.io': {
+                  visits: 1
+                }
+              }
+            }
+          },
+          winners: () => {
+            return []
+          }
+        })
+        ledgerApi.setClient(ledgerClientObject)
+        clientBallotsSpy = sinon.spy(ledgerClientObject, 'ballots')
+      })
+
+      afterEach(() => {
+        clientBallotsSpy.reset()
+      })
+
+      after(() => {
+        clientBallotsSpy.restore()
+        ledgerApi.setSynopsis(undefined)
+      })
+
+      it('exits if state is undefined', function () {
+        ledgerApi.run(undefined, 10)
+        assert.equal(clientBallotsSpy.notCalled, true)
+      })
+
+      it('exits if delayTime is undefined', function () {
+        ledgerApi.run(defaultAppState)
+        assert.equal(clientBallotsSpy.notCalled, true)
+      })
+
+      it('gets balance count from client', function () {
+        ledgerApi.run(defaultAppState, 10)
+        assert.equal(clientBallotsSpy.calledOnce, true)
+      })
+    })
+
+    describe('publishers check', function () {
+      before(() => {
+        ledgerApi.setClient(ledgerClientObject)
+        ledgerSetTimeUntilReconcile.reset()
+      })
+
+      afterEach(() => {
+        ledgerSetTimeUntilReconcile.reset()
+        isReadyToReconcile = false
+      })
+
+      it('null check', function () {
+        ledgerApi.run(defaultAppState, 10)
+        assert(ledgerSetTimeUntilReconcile.notCalled)
+      })
+
+      it('synopsis is broken', function () {
+        const state = defaultAppState
+          .setIn(['ledger', 'about', 'synopsis'], 'test')
+        ledgerApi.run(state, 10)
+        assert(ledgerSetTimeUntilReconcile.notCalled)
+      })
+
+      it('table is empty and we are not ready to reconcile', function () {
+        const state = defaultAppState
+          .setIn(['ledger', 'about', 'synopsis'], Immutable.fromJS([{
+            publisherKey: 'clifton.io'
+          }]))
+        ledgerApi.run(state, 10)
+        assert(ledgerSetTimeUntilReconcile.notCalled)
+      })
+
+      it('table is not empty and we are not ready to reconcile', function () {
+        const state = defaultAppState
+          .setIn(['ledger', 'about', 'synopsis'], Immutable.fromJS([{
+            publisherKey: 'clifton.io'
+          }]))
+        ledgerApi.run(state, 10)
+        assert(ledgerSetTimeUntilReconcile.notCalled)
+      })
+
+      it('table is not empty and we are ready to reconcile', function () {
+        isReadyToReconcile = true
+        const state = defaultAppState
+          .setIn(['ledger', 'about', 'synopsis'], Immutable.fromJS([{
+            publisherKey: 'clifton.io'
+          }]))
+        ledgerApi.run(state, 10)
+        assert(ledgerSetTimeUntilReconcile.notCalled)
+      })
+
+      it('table is empty and we are ready to reconcile', function () {
+        isReadyToReconcile = true
+        ledgerApi.run(defaultAppState, 10)
+        assert(ledgerSetTimeUntilReconcile.calledOnce)
+      })
+    })
+  })
+
+  describe('checkSeed', function () {
+    let valid = false
+
+    before(() => {
+      ledgerApi.setClient({
+        isValidPassPhrase: () => valid
+      })
+    })
+
+    it('seed is null', function () {
+      const result = ledgerApi.checkSeed(defaultAppState)
+      assert.deepEqual(result.toJS(), defaultAppState.toJS())
+    })
+
+    it('seed is valid', function () {
+      valid = true
+      const state = defaultAppState
+        .setIn(['ledger', 'info', 'passphrase'], 'auten nobbling uncharitable decimation sayee unartful biter floodlight scholar cherubical fadable reconnoiter courtesan concussing asymmetrical test')
+      const result = ledgerApi.checkSeed(state)
+      assert.deepEqual(result.toJS(), state.toJS())
+      valid = false
+    })
+
+    it('seed is invalid', function () {
+      const state = defaultAppState
+        .setIn(['ledger', 'info', 'passphrase'], 'a')
+      const exptedState = state
+        .setIn(['ledger', 'about', 'status'], 'corruptedSeed')
+      const result = ledgerApi.checkSeed(state)
+      assert.deepEqual(result.toJS(), exptedState.toJS())
+    })
+  })
+
+  describe('onReferralRead', function () {
+    let setUpdatePropSpy
+
+    before(function () {
+      setUpdatePropSpy = sinon.spy(updateState, 'setUpdateProp')
+    })
+
+    afterEach(function () {
+      setUpdatePropSpy.reset()
+    })
+
+    after(function () {
+      setUpdatePropSpy.restore()
+    })
+
+    it('body data is not immutable', function () {
+      ledgerApi.onReferralRead(defaultAppState, {
+        download_id: 1,
+        referral_code: 'code'
+      })
+      assert(setUpdatePropSpy.withArgs(sinon.match.any, 'referralDownloadId', 1).calledOnce)
+      assert(setUpdatePropSpy.withArgs(sinon.match.any, 'referralPromoCode', 'code').calledOnce)
+    })
+
+    it('download id and referral code is saved', function () {
+      ledgerApi.onReferralRead(defaultAppState, Immutable.fromJS({
+        download_id: 1,
+        referral_code: 'code'
+      }))
+      assert(setUpdatePropSpy.withArgs(sinon.match.any, 'referralDownloadId', 1).calledOnce)
+      assert(setUpdatePropSpy.withArgs(sinon.match.any, 'referralPromoCode', 'code').calledOnce)
+    })
+
+    describe('headers', function () {
+      const headers = Immutable.fromJS({
+        domains: [ 'test.com', 'domain.si' ],
+        headers: { 'X-Brave-Partner': 'partner' },
+        cookieNames: [],
+        expiration: 0
+      })
+
+      it('headers are missing', function () {
+        ledgerApi.onReferralRead(defaultAppState, Immutable.fromJS({}))
+        assert(setUpdatePropSpy.withArgs(sinon.match.any, 'referralHeaders', sinon.match.any).notCalled)
+      })
+
+      it('headers are saved', function () {
+        ledgerApi.onReferralRead(defaultAppState, headers)
+        assert(setUpdatePropSpy.withArgs(sinon.match.any, 'referralHeaders', headers.get('headers')).calledOnce)
+      })
+    })
+
+    describe('landing page', function () {
+      let createTabRequestedSpy
+      const url = 'https://clifton.io'
+
+      before(function () {
+        createTabRequestedSpy = sinon.spy(appActions, 'createTabRequested')
+      })
+
+      afterEach(function () {
+        createTabRequestedSpy.reset()
+      })
+
+      after(function () {
+        createTabRequestedSpy.restore()
+      })
+
+      it('page is missing', function () {
+        ledgerApi.onReferralRead(defaultAppState, Immutable.fromJS({
+          download_id: 1,
+          referral_code: 'code'
+        }))
+        assert(setUpdatePropSpy.withArgs(sinon.match.any, 'referralPage', sinon.match.any).notCalled)
+        assert(createTabRequestedSpy.notCalled)
+      })
+
+      it('page is not an url', function () {
+        ledgerApi.onReferralRead(defaultAppState, Immutable.fromJS({
+          download_id: 1,
+          referral_code: 'code',
+          offer_page_url: 'adasdsadsad'
+        }))
+        assert(setUpdatePropSpy.withArgs(sinon.match.any, 'referralPage', sinon.match.any).notCalled)
+        assert(createTabRequestedSpy.notCalled)
+      })
+
+      it('window is not initialized yet', function () {
+        ledgerApi.onReferralRead(defaultAppState, Immutable.fromJS({
+          download_id: 1,
+          referral_code: 'code',
+          offer_page_url: url
+        }), -1)
+        assert(setUpdatePropSpy.withArgs(sinon.match.any, 'referralPage', url).calledOnce)
+        assert(createTabRequestedSpy.notCalled)
+      })
+
+      it('window is ready', function () {
+        const windowReadyState = defaultAppState.set('windowReady', true)
+        ledgerApi.onReferralRead(windowReadyState, Immutable.fromJS({
+          download_id: 1,
+          referral_code: 'code',
+          offer_page_url: url
+        }), 1)
+        assert(setUpdatePropSpy.withArgs(sinon.match.any, 'referralPage', null).calledOnce)
+        assert(createTabRequestedSpy.withArgs({
+          url,
+          windowId: 1,
+          active: true
+        }).calledOnce)
+      })
+    })
+  })
+
+  describe('getCaptcha', function () {
+    let getPromotionCaptchaSpy
+
+    before(function () {
+      ledgerApi.setClient(ledgerClientObject)
+      getPromotionCaptchaSpy = sinon.spy(ledgerClientObject, 'getPromotionCaptcha')
+    })
+
+    afterEach(function () {
+      getPromotionCaptchaSpy.reset()
+    })
+
+    after(function () {
+      getPromotionCaptchaSpy.restore()
+      ledgerApi.setClient(undefined)
+    })
+
+    it('no promotion', function () {
+      ledgerApi.getCaptcha(defaultAppState)
+      assert(getPromotionCaptchaSpy.notCalled)
+    })
+
+    it('gets new promotion', function () {
+      const state = defaultAppState
+        .setIn(['ledger', 'promotion'], Immutable.fromJS({
+          promotionId: 1
+        }))
+
+      ledgerApi.getCaptcha(state)
+      assert(getPromotionCaptchaSpy.withArgs(1, sinon.match.any).calledOnce)
+    })
+  })
+
+  describe('onCaptchaResponse', function () {
+    const body = new Uint8Array([255, 216, 255, 219, 0])
+
+    it('null case', function () {
+      const expectedState = defaultAppState
+        .setIn(['ledger', 'promotion', 'promotionStatus'], promotionStatuses.CAPTCHA_ERROR)
+      const result = ledgerApi.onCaptchaResponse(defaultAppState)
+      assert.deepEqual(result.toJS(), expectedState.toJS())
+    })
+
+    it('responose too many', function () {
+      const expectedState = defaultAppState
+        .setIn(['ledger', 'promotion', 'promotionStatus'], promotionStatuses.CAPTCHA_BLOCK)
+      const result = ledgerApi.onCaptchaResponse(defaultAppState, Immutable.fromJS({statusCode: 429}))
+      assert.deepEqual(result.toJS(), expectedState.toJS())
+    })
+
+    it('responose not found', function () {
+      const expectedState = defaultAppState
+        .setIn(['ledger', 'promotion', 'promotionStatus'], promotionStatuses.CAPTCHA_ERROR)
+      const result = ledgerApi.onCaptchaResponse(defaultAppState, Immutable.fromJS({statusCode: 404}))
+      assert.deepEqual(result.toJS(), expectedState.toJS())
+    })
+
+    it('new captcha', function () {
+      const expectedState = defaultAppState
+        .setIn(['ledger', 'promotion', 'promotionStatus'], promotionStatuses.CAPTCHA_CHECK)
+        .setIn(['ledger', 'promotion', 'captcha'], 'data:image/jpeg;base64,/9j/2wA=')
+        .setIn(['ledger', 'promotion', 'captchaHint'], 'grey')
+      const result = ledgerApi.onCaptchaResponse(defaultAppState, null, body, 'grey')
+      assert.deepEqual(result.toJS(), expectedState.toJS())
+    })
+
+    it('replacing exiting captcha', function () {
+      const state = defaultAppState
+        .setIn(['ledger', 'promotion', 'promotionStatus'], promotionStatuses.CAPTCHA_ERROR)
+      const expectedState = defaultAppState
+        .setIn(['ledger', 'promotion', 'promotionStatus'], promotionStatuses.CAPTCHA_ERROR)
+        .setIn(['ledger', 'promotion', 'captcha'], 'data:image/jpeg;base64,/9j/2wA=')
+        .setIn(['ledger', 'promotion', 'captchaHint'], 'grey')
+      const result = ledgerApi.onCaptchaResponse(state, null, body, 'grey')
+      assert.deepEqual(result.toJS(), expectedState.toJS())
+    })
+  })
+
+  describe('disablePayments', function () {
+    beforeEach(function () {
+      onChangeSettingSpy.reset()
+    })
+
+    it('goes to set PAYMENTS_ENABLED to false', function () {
+      ledgerApi.disablePayments()
+      assert(onChangeSettingSpy.withArgs(settings.PAYMENTS_ENABLED, false).calledOnce)
+    })
+  })
+
+  describe('deleteWallet', function () {
+    let deletePaymentsFilesSpy
+
+    const state = defaultAppState
+      .setIn(['cache', 'ledgerVideos'], Immutable.fromJS({
+        'youtube_Ece3i74Wces': 'youtube#channel:radio1slovenia'
+      }))
+      .setIn(['settings', 'payments.enabled'], true)
+      .set('pageData', Immutable.fromJS({
+        info: {
+          'https://www.youtube.com/user/radio1slovenia/videos': {
+            faviconURL: 'https://s.ytimg.com/yts/img/favicon_32-vflOogEID.png',
+            key: 'https://www.youtube.com/user/radio1slovenia/videos',
+            protocol: 'https:',
+            publisher: 'youtube.com',
+            timestamp: 1526367684155,
+            url: 'https://www.youtube.com/user/radio1slovenia/videos'
+          }
+        },
+        last: {
+          closedTabValue: {
+            audible: false,
+            width: 2560,
+            active: true
+          },
+          info: '',
+          tabId: '7'
+        }
+      }))
+      .set('ledger', Immutable.fromJS({
+        about: {
+          synopsis: [
+            {
+              daysSpent: 0,
+              duration: 166431,
+              exclude: false,
+              faviconURL: 'data:image/jpeg;base64',
+              hoursSpent: 0,
+              minutesSpent: 2,
+              percentage: 38,
+              pinPercentage: undefined,
+              providerName: 'YouTube',
+              publisherKey: 'youtube#channel:radio1slovenia',
+              publisherURL: 'https://www.youtube.com/user/radio1slovenia/videos',
+              score: 14.588460435541956,
+              secondsSpent: 46,
+              siteName: 'radio1slovenia on YouTube',
+              verified: false,
+              views: 2,
+              weight: 38.244594657485045
+            }
+          ],
+          synopsisOptions: {
+            _a: 7000,
+            _b: 1000,
+            scorekeeper: 'concave',
+            _d: 0.000033333333333333335
+          }
+        },
+        info: {
+          balance: 0,
+          paymentId: 'ladasda'
+        },
+        locations: {
+          'https://www.youtube.com/user/radio1slovenia/videos': {
+            publisher: 'youtube.com'
+          }
+        },
+        synopsis: {
+          options: {
+            _a: 7000,
+            _b: 1000,
+            scorekeeper: 'concave',
+            _d: 0.000033333333333333335
+          },
+          publishers: {
+            'youtube#channel:radio1slovenia': {
+              duration: 166431,
+              options: {
+                exclude: false
+              },
+              pinPercentage: 20,
+              scores: {
+                concave: 3.249426617127623,
+                visits: 2
+              },
+              views: 2,
+              weight: 20
+            }
+          }
+        },
+        promotion: {}
+      }))
+
+    before(function () {
+      deletePaymentsFilesSpy = sinon.spy(ledgerApi, 'deletePaymentsFiles')
+    })
+
+    afterEach(function () {
+      deletePaymentsFilesSpy.reset()
+    })
+
+    after(function () {
+      deletePaymentsFilesSpy.restore()
+    })
+
+    it('data is cleared', function () {
+      const result = ledgerApi.deleteWallet(state)
+      const expectedState = state
+        .set('ledger', Immutable.fromJS({
+          about: {
+            synopsis: [],
+            synopsisOptions: {}
+          },
+          info: {},
+          locations: {},
+          synopsis: {
+            options: {},
+            publishers: {}
+          },
+          promotion: {}
+        }))
+        .setIn(['cache', 'ledgerVideos'], Immutable.Map())
+        .setIn(['pageData', 'info'], Immutable.Map())
+        .setIn(['pageData', 'last', 'info'], null)
+        .setIn(['pageData', 'last', 'tabId'], null)
+        .setIn(['pageData', 'last', 'closedTabValue'], null)
+        .setIn(['settings', 'payments.enabled'], false)
+        .setIn(['updates', 'verifiedPublishersTimestamp'], null)
+
+      assert.deepEqual(result.toJS(), expectedState.toJS())
+      assert.equal(ledgerApi.getClient(), null)
+      assert.equal(ledgerApi.getSynopsis(), null)
+    })
+
+    it('calls function to delete payments files', function () {
+      ledgerApi.deleteWallet(state)
+      assert(deletePaymentsFilesSpy.calledOnce)
+    })
+  })
+
+  describe('deletePaymentsFiles', function () {
+    let accessStub, unlinkStub
+    const statePath = 'ledger-state.json'
+    const publishersInfoPath = 'publisher-data.json'
+
+    before(function () {
+      unlinkStub = sinon.stub(fs, 'unlink', function (path, callback) {
+        callback(null)
+      })
+      accessStub = sinon.stub(fs, 'access', function (path, fOk, callback) {
+        fs.unlink(path, function (err) {
+          // Satisfies the linter
+          if (err) {
+            console.log('Something went wrong')
+          }
+        })
+      })
+    })
+
+    afterEach(function () {
+      accessStub.reset()
+      unlinkStub.reset()
+    })
+
+    after(function () {
+      accessStub.restore()
+      unlinkStub.restore()
+    })
+
+    it('accesses and deletes ledger state and publisher data files', function () {
+      ledgerApi.deletePaymentsFiles()
+      assert.equal(ledgerApi.pathName(statePath), accessStub.getCall(0).args[0])
+      assert.equal(ledgerApi.pathName(statePath), unlinkStub.getCall(0).args[0])
+      assert.equal(ledgerApi.pathName(publishersInfoPath), accessStub.getCall(1).args[0])
+      assert.equal(ledgerApi.pathName(publishersInfoPath), unlinkStub.getCall(1).args[0])
+    })
+  })
+
+  describe('clearPaymentHistory', function () {
+    it('execute', function () {
+      const state = defaultAppState
+        .setIn(['ledger', 'info', 'transactions'], Immutable.fromJS([{
+          viewingId: 1
+        }]))
+        .setIn(['ledger', 'info', 'ballots'], Immutable.fromJS([{
+          viewingId: 1
+        }]))
+        .setIn(['ledger', 'info', 'batch'], Immutable.fromJS([{
+          'clifton.io': {
+            proof: 1
+          }
+        }]))
+
+      const result = ledgerApi.clearPaymentHistory(state)
+
+      const expectedState = defaultAppState
+        .setIn(['ledger', 'info', 'transactions'], Immutable.fromJS([]))
+        .setIn(['ledger', 'info', 'ballots'], Immutable.fromJS([]))
+        .setIn(['ledger', 'info', 'batch'], Immutable.fromJS([]))
+      assert.deepEqual(result.toJS(), expectedState.toJS())
+    })
+  })
+
+  describe('resetPublishers', function () {
+    let resetPublishersSpy
+
+    before(function () {
+      ledgerApi.setSynopsis({
+        publishers: {
+          'clifton.io': {
+            time: 1
+          }
+        }
+      })
+      resetPublishersSpy = sinon.spy(ledgerState, 'resetPublishers')
+    })
+
+    afterEach(function () {
+      resetPublishersSpy.reset()
+    })
+
+    after(function () {
+      resetPublishersSpy.restore()
+    })
+
+    it('execute', function () {
+      ledgerApi.resetPublishers(defaultAppState)
+      assert(resetPublishersSpy.calledOnce)
+      assert.deepEqual(ledgerApi.getSynopsis(), {publishers: {}})
+    })
+  })
+
+  describe('getBalance', function () {
+    let getPaymentInfoSpy
+
+    before(function () {
+      getPaymentInfoSpy = sinon.spy(ledgerApi, 'getPaymentInfo')
+    })
+
+    afterEach(function () {
+      getPaymentInfoSpy.reset()
+    })
+
+    after(function () {
+      getPaymentInfoSpy.restore()
+      ledgerApi.setClient(undefined)
+    })
+
+    it('client is not set up', function () {
+      ledgerApi.setClient(null)
+      ledgerApi.getBalance(defaultAppState)
+      assert(getPaymentInfoSpy.notCalled)
+    })
+
+    it('status is in progress', function () {
+      ledgerApi.setClient(ledgerClientObject)
+      const state = defaultAppState
+        .setIn(['ledger', 'about', 'status'], ledgerStatuses.IN_PROGRESS)
+      ledgerApi.getBalance(state)
+      assert(getPaymentInfoSpy.notCalled)
+    })
+
+    it('executes', function () {
+      ledgerApi.setClient(ledgerClientObject)
+      ledgerApi.getBalance(defaultAppState)
+      assert(getPaymentInfoSpy.calledOnce)
+    })
+  })
+
+  describe('getPaymentInfo', function () {
+    let getWalletPropertiesSpy
+
+    before(function () {
+      ledgerApi.setClient(ledgerClientObject)
+      getWalletPropertiesSpy = sinon.spy(ledgerClientObject, 'getWalletProperties')
+    })
+
+    afterEach(function () {
+      getWalletPropertiesSpy.reset()
+    })
+
+    after(function () {
+      getWalletPropertiesSpy.restore()
+      ledgerApi.setClient(undefined)
+    })
+
+    it('not called when contribution is in progress', function () {
+      const state = defaultAppState
+        .setIn(['ledger', 'about', 'status'], ledgerStatuses.IN_PROGRESS)
+      ledgerApi.getBalance(state)
+      assert(getWalletPropertiesSpy.notCalled)
+    })
+
+    it('executes', function () {
+      ledgerApi.getBalance(defaultAppState)
+      assert(getWalletPropertiesSpy.calledOnce)
+    })
+  })
+
+  describe('paymentPresent', function () {
+    describe('captcha', function () {
+      it('captcha is displayed and payments page is opened', function () {
+        const state = defaultAppState
+          .setIn(['ledger', 'promotion', 'promotionStatus'], promotionStatuses.CAPTCHA_CHECK)
+        const result = ledgerApi.paymentPresent(state, 1, true)
+        assert.deepEqual(result.toJS(), state.toJS())
+      })
+
+      it('captcha is displayed and payments page is not opened', function () {
+        const state = defaultAppState
+          .setIn(['ledger', 'promotion', 'promotionStatus'], promotionStatuses.CAPTCHA_CHECK)
+        const expectedState = defaultAppState
+          .setIn(['ledger', 'promotion', 'promotionStatus'], null)
+        const result = ledgerApi.paymentPresent(state, 1, false)
+        assert.deepEqual(result.toJS(), expectedState.toJS())
+      })
+
+      it('captcha error is displayed and payments page is not opened', function () {
+        const state = defaultAppState
+          .setIn(['ledger', 'promotion', 'promotionStatus'], promotionStatuses.CAPTCHA_ERROR)
+        const expectedState = defaultAppState
+          .setIn(['ledger', 'promotion', 'promotionStatus'], null)
+        const result = ledgerApi.paymentPresent(state, 1, false)
+        assert.deepEqual(result.toJS(), expectedState.toJS())
+      })
+
+      it('captcha is not displayed and payments page is not opened', function () {
+        const state = defaultAppState
+          .setIn(['ledger', 'promotion', 'promotionStatus'], promotionStatuses.GENERAL_ERROR)
+        const result = ledgerApi.paymentPresent(state, 1, false)
+        assert.deepEqual(result.toJS(), state.toJS())
+      })
+    })
+
+    describe('promotion polling', function () {
+      let onPromotionGetSpy
+
+      before(function () {
+        onPromotionGetSpy = sinon.spy(appActions, 'onPromotionGet')
+      })
+
+      after(function () {
+        onPromotionGetSpy.restore()
+      })
+
+      afterEach(function () {
+        onPromotionGetSpy.reset()
+      })
+
+      it('is called without payments enabled', function () {
+        ledgerApi.paymentPresent(defaultAppState, 1, true)
+        assert(onPromotionGetSpy.calledOnce)
+      })
+
+      it('is not called if not on payments screen', function () {
+        ledgerApi.paymentPresent(defaultAppState, 1, false)
+        assert(onPromotionGetSpy.notCalled)
+      })
+    })
+  })
+
+  describe('onFuzzing', function () {
+    let onLedgerFuzzingSpy
+
+    before(function () {
+      onLedgerFuzzingSpy = sinon.spy(appActions, 'onLedgerFuzzing')
+    })
+
+    beforeEach(function () {
+      ledgerApi.setClient(ledgerClientObject)
+    })
+
+    afterEach(function () {
+      onLedgerFuzzingSpy.reset()
+    })
+
+    after(function () {
+      onLedgerFuzzingSpy.restore()
+      ledgerApi.setClient(undefined)
+    })
+
+    it('null case', function () {
+      ledgerApi.onFuzzing()
+      assert(onLedgerFuzzingSpy.withArgs(null, false).calledOnce)
+    })
+
+    it('client is not set', function () {
+      ledgerApi.setClient(undefined)
+      ledgerApi.onFuzzing()
+      assert(onLedgerFuzzingSpy.notCalled)
+    })
+
+    it('push back is not happening', function () {
+      ledgerApi.onFuzzing(null, true)
+      assert(onLedgerFuzzingSpy.withArgs(null, true).calledOnce)
+    })
+
+    it('pushing back', function () {
+      ledgerApi.onFuzzing(10, true)
+      assert(onLedgerFuzzingSpy.withArgs(1000, true).calledOnce)
+    })
+  })
+
+  describe('getPublisherInfo', function () {
+    let fetchPublisherInfoSpy, onPublishersInfoReceivedSpy
+
+    before(function () {
+      fetchPublisherInfoSpy = sinon.spy(ledgerClientObject, 'fetchPublisherInfo')
+      onPublishersInfoReceivedSpy = sinon.spy(appActions, 'onPublishersInfoReceived')
+    })
+
+    after(function () {
+      fetchPublisherInfoSpy.restore()
+      onPublishersInfoReceivedSpy.restore()
+    })
+
+    afterEach(function () {
+      fetchPublisherInfoSpy.reset()
+      onPublishersInfoReceivedSpy.reset()
+    })
+
+    it('does nothing when the client is undefined', function () {
+      ledgerApi.setClient(undefined)
+      ledgerApi.getPublisherInfo()
+      assert(fetchPublisherInfoSpy.notCalled)
+    })
+
+    it('makes request and dispatches app action', function () {
+      ledgerApi.setClient(ledgerClientObject)
+      ledgerApi.getPublisherInfo()
+      assert(fetchPublisherInfoSpy.calledOnce)
+      assert(onPublishersInfoReceivedSpy.calledOnce)
+    })
+  })
+
+  describe('checkPublisherInfoUpdate', function () {
+    let fakeClock, getPublisherInfoSpy
+    const delay = 1000 * 15
+    const day = 1000 * 60 * 60 * 24
+
+    beforeEach(function () {
+      fakeClock = sinon.useFakeTimers()
+      ledgerApi.clearVisitsByPublisher()
+    })
+
+    before(function () {
+      getPublisherInfoSpy = sinon.spy(ledgerApi, 'getPublisherInfo')
+    })
+
+    after(function () {
+      getPublisherInfoSpy.restore()
+    })
+
+    afterEach(function () {
+      fakeClock.restore()
+      getPublisherInfoSpy.reset()
+    })
+
+    it('calls getPublisherInfo (no delay) when no timestamp is present and client exists', function () {
+      ledgerApi.setClient(ledgerClientObject)
+      ledgerApi.checkPublisherInfoUpdate(defaultAppState)
+      fakeClock.tick(delay)
+      assert(getPublisherInfoSpy.calledOnce)
+    })
+
+    it('calls getPublisherInfo when no timestamp is present and client is undefined', function () {
+      ledgerApi.setClient(undefined)
+      ledgerApi.checkPublisherInfoUpdate(defaultAppState)
+      fakeClock.tick(delay)
+      assert(getPublisherInfoSpy.calledOnce)
+    })
+
+    it('doesn\'t call getPublisherInfo when last check has happened in the past two days', function () {
+      const state = defaultAppState
+        .setIn(['updates', 'verifiedPublishersTimestamp'], day)
+      fakeClock.tick(new Date().getTime())
+      ledgerApi.setClient(ledgerClientObject)
+      ledgerApi.checkPublisherInfoUpdate(state)
+      assert(getPublisherInfoSpy.notCalled)
+    })
+  })
+
+  describe('runPublishersUpdate', function () {
+    let updatePublishersSpy
+
+    before(function () {
+      updatePublishersSpy = sinon.spy(ledgerApi, 'updatePublishers')
+    })
+
+    after(function () {
+      updatePublishersSpy.restore()
+      ledgerApi.setSynopsis(undefined)
+    })
+
+    afterEach(function () {
+      updatePublishersSpy.reset()
+    })
+
+    it('calls verifiedP with an array of publisher keys', function () {
+      const expectedKeys = ['brave.com', 'clifton.io']
+      const state = defaultAppState
+        .setIn(['ledger', 'synopsis'], Immutable.fromJS({
+          publishers: {
+            'brave.com': {
+              verified: true,
+              exclude: false,
+              options: {
+                exclude: true
+              },
+              publisherURL: 'https://brave.com'
+            },
+            'clifton.io': {
+              verified: true,
+              exclude: false,
+              options: {
+                exclude: true
+              },
+              publisherURL: 'https://clifton.io'
+            }
+          }
+        }))
+      ledgerApi.runPublishersUpdate(state)
+      assert(updatePublishersSpy.withArgs(state, expectedKeys).calledOnce)
+    })
+    it('does not call verifiedP when there are no publishers in the synopsis', function () {
+      ledgerApi.runPublishersUpdate(defaultAppState)
+      assert(updatePublishersSpy.notCalled)
+    })
+  })
+
+  describe('updatePublishers', function () {
+    let readFileStub, onPublishersInfoReadSpy
+    const corruptData = '[{"brave.com",true,false],["vimeo.com",false,false]]'
+    const readData = '[["brave.com",true,false],["vimeo.com",false,false]]'
+
+    before(function () {
+      onPublishersInfoReadSpy = sinon.spy(appActions, 'onPublishersInfoRead')
+    })
+
+    afterEach(function () {
+      readFileStub.restore()
+      onPublishersInfoReadSpy.reset()
+      ledgerApi.setPublisherInfoData(null)
+    })
+
+    after(function () {
+      onPublishersInfoReadSpy.restore()
+    })
+
+    it('dispatches onPublishersInfoRead with read data', function () {
+      readFileStub = sinon.stub(fs, 'readFile', (path, callback) => {
+        callback(null, readData)
+      })
+
+      ledgerApi.updatePublishers(defaultAppState, ['brave.com'])
+      assert.deepEqual(['brave.com'], onPublishersInfoReadSpy.getCall(0).args[0])
+      assert.deepEqual(Immutable.fromJS(JSON.parse(readData)), onPublishersInfoReadSpy.getCall(0).args[1])
+    })
+
+    it('does not dispatch file read if publisherInfoData has value', function () {
+      const infoData = Immutable.fromJS([
+        ['brave.com', true, false]
+      ])
+      readFileStub = sinon.stub(fs, 'readFile', (path, callback) => {
+        callback(null, readData)
+      })
+
+      ledgerApi.setPublisherInfoData(infoData)
+      ledgerApi.updatePublishers(defaultAppState, ['brave.com'])
+      assert(onPublishersInfoReadSpy.withArgs(['brave.com'], infoData).calledOnce)
+      assert(readFileStub.notCalled)
+    })
+
+    it('does not dispatch onPublishersInfoRead if data from file cannot be parsed as JSON', function () {
+      readFileStub = sinon.stub(fs, 'readFile', (path, callback) => {
+        callback(null, corruptData)
+      })
+
+      ledgerApi.updatePublishers(defaultAppState, ['brave.com'])
+      assert(onPublishersInfoReadSpy.notCalled)
+    })
+
+    it('does not dispatch onPublishersInfoRead if there was a read error', function () {
+      readFileStub = sinon.stub(fs, 'readFile', (path, callback) => {
+        const error = {'success': false}
+        callback(error, readData)
+      })
+
+      ledgerApi.updatePublishers(defaultAppState, ['brave.com'])
+      assert(onPublishersInfoReadSpy.notCalled)
+    })
+  })
+
+  describe('checkExclusionRules', function () {
+    it('excludes sites with the .gov tld', function () {
+      assert(ledgerApi.shouldExclude('usa.gov'))
+      assert(ledgerApi.shouldExclude('fda.gov'))
+      assert(ledgerApi.shouldExclude('nsa.gov'))
+    })
+    it('excludes sites with the .gov tld + www', function () {
+      assert(ledgerApi.shouldExclude('www.whitehouse.gov'))
+      assert(ledgerApi.shouldExclude('www.nsa.gov'))
+      assert(ledgerApi.shouldExclude('https://www.fda.gov/'))
+    })
+    it('excludes japanese government sites', function () {
+      assert(ledgerApi.shouldExclude('jasso.go.jp'))
+      assert(ledgerApi.shouldExclude('nenkin.go.jp'))
+    })
+    it('government sites that use gov as their root hostname', function () {
+      assert(ledgerApi.shouldExclude('gov.ie'))
+      assert(ledgerApi.shouldExclude('aces.gov.in'))
+      assert(ledgerApi.shouldExclude('aponline.gov.in'))
+      assert(ledgerApi.shouldExclude('apspsc.gov.in'))
+      assert(ledgerApi.shouldExclude('asic.gov.au'))
+      assert(ledgerApi.shouldExclude('tnpsc.gov.in'))
+      assert(ledgerApi.shouldExclude('pscwbonline.gov.in'))
+      assert(ledgerApi.shouldExclude('india.gov.in'))
+    })
+    it('excludes keybase.pub', function () {
+      assert(ledgerApi.shouldExclude('keybase.pub'))
+    })
+    it('does not exclude non government, non keybase sites', function () {
+      assert.equal(false, ledgerApi.shouldExclude('brave.com'))
+      assert.equal(false, ledgerApi.shouldExclude('amazon.co.uk'))
+      assert.equal(false, ledgerApi.shouldExclude('ilovegov.co'))
+      assert.equal(false, ledgerApi.shouldExclude('www.biggov.com'))
+      assert.equal(false, ledgerApi.shouldExclude('www.yahoo.com'))
+      assert.equal(false, ledgerApi.shouldExclude('clifton.io'))
+      assert.equal(false, ledgerApi.shouldExclude('socket.io'))
+    })
+  })
+
+  describe('getPublisherExclude', function () {
+    let fakeClock, donePSpy, getPublisherExcludeSpy, shouldExcludeSpy
+    const callback = (err, result) => {
+      if (err) {
+        console.log('Something went wrong')
+      }
+    }
+
+    before(function () {
+      fakeClock = sinon.useFakeTimers()
+      donePSpy = sinon.spy(ledgerApi, 'doneP')
+      getPublisherExcludeSpy = sinon.spy(ledgerApi, 'getPublisherExclude')
+      shouldExcludeSpy = sinon.spy(ledgerApi, 'shouldExclude')
+    })
+
+    afterEach(function () {
+      donePSpy.reset()
+      getPublisherExcludeSpy.reset()
+      shouldExcludeSpy.reset()
+    })
+
+    after(function () {
+      fakeClock.restore()
+      donePSpy.restore()
+      getPublisherExcludeSpy.restore()
+      shouldExcludeSpy.restore()
+    })
+
+    it('retries after 15 seconds if there is no publisherInfoData', function () {
+      ledgerApi.setPublisherInfoData(undefined)
+      ledgerApi.getPublisherExclude('brave.com', callback)
+      getPublisherExcludeSpy.reset()
+      fakeClock.tick(15000)
+      assert(getPublisherExcludeSpy.calledOnce)
+    })
+
+    it('defers to exclusion rules if publisher is not in publisherInfoData', function () {
+      ledgerApi.setPublisherInfoData(Immutable.fromJS([
+        ['null.com', true, true]
+      ]))
+      ledgerApi.getPublisherExclude('brave.com', callback)
+      assert(shouldExcludeSpy.withArgs('brave.com').calledOnce)
+      assert(donePSpy.withArgs(null, false, callback).calledOnce)
+    })
+
+    it('returns exclude as expected from publisherInfoData', function () {
+      ledgerApi.setPublisherInfoData(Immutable.fromJS([
+        ['brave.com', true, true],
+        ['clifton.io', true, false]
+      ]))
+      ledgerApi.getPublisherExclude('brave.com', callback)
+      assert(donePSpy.withArgs(null, true, callback).calledOnce)
+      donePSpy.reset()
+
+      ledgerApi.getPublisherExclude('clifton.io', callback)
+      assert(donePSpy.withArgs(null, false, callback).calledOnce)
+    })
+  })
+
+  describe('updatePublishersInfo', function () {
+    let onPublishersOptionUpdateSpy
+
+    before(function () {
+      onPublishersOptionUpdateSpy = sinon.spy(appActions, 'onPublishersOptionUpdate')
+    })
+
+    after(function () {
+      onPublishersOptionUpdateSpy.restore()
+      ledgerApi.setSynopsis(undefined)
+    })
+
+    afterEach(function () {
+      onPublishersOptionUpdateSpy.reset()
+    })
+
+    it('dispatches onPublishersOptionUpdate with updateData', function () {
+      const publisherKeys = Immutable.fromJS(['brave.com', 'clifton.io'])
+      const publisherData = Immutable.fromJS([
+        ['brave.com', true, false],
+        ['clifton.io', true, false]
+      ])
+      const defaultSynopsis = {
+        publishers: {
+          'brave.com': {
+            verified: false,
+            exclude: false,
+            options: {
+              exclude: true
+            },
+            publisherURL: 'https://brave.com'
+          },
+          'clifton.io': {
+            verified: false,
+            exclude: false,
+            options: {
+              exclude: true
+            },
+            publisherURL: 'https://clifton.io'
+          }
+        }
+      }
+      const state = defaultAppState
+        .setIn(['ledger', 'synopsis'], Immutable.fromJS(defaultSynopsis))
+      const expectedData = [
+        {
+          verified: true,
+          publisherKey: 'brave.com'
+        },
+        {
+          verified: true,
+          publisherKey: 'clifton.io'
+        }
+      ]
+
+      ledgerApi.setSynopsis(defaultSynopsis)
+      ledgerApi.updatePublishersInfo(state, publisherKeys, publisherData)
+      assert(onPublishersOptionUpdateSpy.withArgs(expectedData).calledOnce)
+    })
+
+    it('does not dispatch onPublishersOptionUpdate when there is nothing to change', function () {
+      const publisherKeys = Immutable.fromJS(['brave.com', 'clifton.io'])
+      const publisherData = Immutable.fromJS([
+        ['null.com', true, false]
+      ])
+      const state = defaultAppState
+        .setIn(['ledger', 'synopsis'], Immutable.fromJS({
+          publishers: {
+            'brave.com': {
+              verified: false,
+              exclude: false,
+              options: {
+                exclude: true
+              },
+              publisherURL: 'https://brave.com'
+            },
+            'clifton.io': {
+              verified: false,
+              exclude: false,
+              options: {
+                exclude: true
+              },
+              publisherURL: 'https://clifton.io'
+            }
+          }
+        }))
+      ledgerApi.updatePublishersInfo(state, publisherKeys, publisherData)
+      assert(onPublishersOptionUpdateSpy.notCalled)
+    })
+
+    it('updates publishers according to verified data', function () {
+      const publisherKeys = Immutable.fromJS(['brave.com', 'clifton.io'])
+      const publisherData = Immutable.fromJS([
+        ['brave.com', false, false],
+        ['clifton.io', true, false]
+      ])
+      const defaultSynopsis = {
+        publishers: {
+          'brave.com': {
+            verified: false,
+            exclude: false,
+            options: {
+              exclude: true
+            },
+            publisherURL: 'https://brave.com'
+          },
+          'clifton.io': {
+            verified: false,
+            exclude: false,
+            options: {
+              exclude: true
+            },
+            publisherURL: 'https://clifton.io'
+          }
+        }
+      }
+      const state = defaultAppState
+        .setIn(['ledger', 'synopsis'], Immutable.fromJS(defaultSynopsis))
+
+      ledgerApi.setSynopsis(defaultSynopsis)
+      ledgerApi.updatePublishersInfo(state, publisherKeys, publisherData)
+
+      const synopsis = ledgerApi.getSynopsis()
+      assert.equal(false, synopsis.publishers['brave.com'].options.verified)
+      assert.equal(true, synopsis.publishers['clifton.io'].options.verified)
+    })
+  })
+
+  describe('checkBrowserActivityTime', function () {
+    afterEach(function () {
+      ledgerApi.setSynopsis(undefined)
+    })
+
+    it('returns state when there are no publishers', function () {
+      const synopsis = {
+        options: {},
+        publishers: {}
+      }
+      const state = defaultAppState
+        .setIn(['ledger', 'synopsis'], Immutable.fromJS(synopsis))
+
+      ledgerApi.setSynopsis(synopsis)
+
+      const result = ledgerApi.checkBrowserActivityTime(state)
+      assert.deepEqual(result.toJS(), state.toJS())
+    })
+
+    it('returns state if browsingTime is cached at >= 30 minutes, and ledger doesn\'t have a fuzzed status', function () {
+      const synopsis = {
+        options: {},
+        publishers: {
+          'brave.com': {
+            visits: 2,
+            duration: 1080000
+          },
+          'clifton.io': {
+            visits: 3,
+            duration: 1200000
+          }
+        }
+      }
+      const state = defaultAppState
+        .setIn(['ledger', 'synopsis'], Immutable.fromJS(synopsis))
+        .setIn(['ledger', 'about', 'browsingTime'], 2280000)
+
+      ledgerApi.setSynopsis(synopsis)
+
+      const result = ledgerApi.checkBrowserActivityTime(state)
+      assert.deepEqual(result.toJS(), state.toJS())
+    })
+
+    it('return state if cached time is less than 30 minutes and status is not fuzzed', function () {
+      const synopsis = {
+        options: {},
+        publishers: {
+          'brave.com': {
+            visits: 2,
+            duration: 420000
+          },
+          'clifton.io': {
+            visits: 3,
+            duration: 425000
+          }
+        }
+      }
+      const state = defaultAppState
+        .setIn(['ledger', 'synopsis'], Immutable.fromJS(synopsis))
+        .setIn(['ledger', 'about', 'status'], ledgerStatuses.CORRUPTED_SEED)
+
+      ledgerApi.setSynopsis(synopsis)
+
+      const result = ledgerApi.checkBrowserActivityTime(state)
+      assert.deepEqual(result.toJS(), state.toJS())
+    })
+
+    it('does not unset status if browsing time is less than 30 minutes, and ledger has a fuzzed status', function () {
+      const synopsis = {
+        options: {},
+        publishers: {
+          'brave.com': {
+            visits: 2,
+            duration: 20000
+          },
+          'clifton.io': {
+            visits: 3,
+            duration: 40000
+          }
+        }
+      }
+      const state = defaultAppState
+        .setIn(['ledger', 'synopsis'], Immutable.fromJS(synopsis))
+        .setIn(['ledger', 'about', 'status'], ledgerStatuses.FUZZING)
+
+      const expectedState = state
+        .setIn(['ledger', 'about', 'browsingTime'], 60000)
+
+      ledgerApi.setSynopsis(synopsis)
+
+      const result = ledgerApi.checkBrowserActivityTime(state)
+      assert.deepEqual(result.toJS(), expectedState.toJS())
+    })
+
+    it('unsets status if browsingTime is >= 30 minutes and ledgerStatus is fuzzing', function () {
+      const synopsis = {
+        options: {},
+        publishers: {
+          'brave.com': {
+            visits: 2,
+            duration: 1080000
+          },
+          'clifton.io': {
+            visits: 3,
+            duration: 1200000
+          }
+        }
+      }
+      const state = defaultAppState
+        .setIn(['ledger', 'synopsis'], Immutable.fromJS(synopsis))
+        .setIn(['ledger', 'about', 'status'], ledgerStatuses.FUZZING)
+
+      const expectedState = state
+        .setIn(['ledger', 'about', 'browsingTime'], 2280000)
+        .setIn(['ledger', 'about', 'status'], '')
+
+      ledgerApi.setSynopsis(synopsis)
+
+      const result = ledgerApi.checkBrowserActivityTime(state)
+      assert.deepEqual(result.toJS(), expectedState.toJS())
+    })
+
+    it('caches browsing time and unsets status if browsing time is greater than 30 minutes', function () {
+      const synopsis = {
+        options: {},
+        publishers: {
+          'brave.com': {
+            visits: 2,
+            duration: 1080000
+          },
+          'clifton.io': {
+            visits: 3,
+            duration: 1200000
+          }
+        }
+      }
+      const state = defaultAppState
+        .setIn(['ledger', 'synopsis'], Immutable.fromJS(synopsis))
+        .setIn(['ledger', 'about', 'status'], ledgerStatuses.FUZZING)
+
+      const expectedState = state
+        .setIn(['ledger', 'about', 'status'], '')
+        .setIn(['ledger', 'about', 'browsingTime'], 2280000)
+
+      ledgerApi.setSynopsis(synopsis)
+
+      const result = ledgerApi.checkBrowserActivityTime(state)
+      assert.deepEqual(result.toJS(), expectedState.toJS())
     })
   })
 })

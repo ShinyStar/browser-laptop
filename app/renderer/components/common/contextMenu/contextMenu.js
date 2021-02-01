@@ -15,8 +15,14 @@ const windowActions = require('../../../../../js/actions/windowActions')
 // Constants
 const keyCodes = require('../../../../common/constants/keyCodes')
 
+// State
+const contextMenuState = require('../../../../common/state/contextMenuState')
+const tabState = require('../../../../common/state/tabState')
+const appStore = require('../../../../../js/stores/appStoreRenderer')
+const { getActiveFrame, isTor } = require('../../../../../js/state/frameStateUtil')
+const { getCurrentWindowId } = require('../../../currentWindow')
+
 // Utils
-const frameStateUtil = require('../../../../../js/state/frameStateUtil')
 const {separatorMenuItem} = require('../../../../common/commonMenu')
 const {wrappingClamp} = require('../../../../common/lib/formatUtil')
 
@@ -216,12 +222,15 @@ class ContextMenu extends React.Component {
 
   mergeProps (state, ownProps) {
     const currentWindow = state.get('currentWindow')
-    const activeFrame = frameStateUtil.getActiveFrame(currentWindow) || Immutable.Map()
+
     const selectedIndex = currentWindow.getIn(['ui', 'contextMenu', 'selectedIndex'], null)
-    const contextMenuDetail = currentWindow.get('contextMenuDetail', Immutable.Map())
+    const contextMenuDetail = contextMenuState.getContextMenu(currentWindow)
 
     const props = {}
-    props.lastZoomPercentage = activeFrame.get('lastZoomPercentage')
+    const activeTab = tabState.getActiveTab(appStore.state, getCurrentWindowId())
+    const activeFrame = getActiveFrame(currentWindow)
+    props.isTor = activeFrame && isTor(activeFrame)
+    props.lastZoomPercentage = activeTab && activeTab.get('zoomPercent')
     props.contextMenuDetail = contextMenuDetail  // TODO (nejc) only primitives
     props.selectedIndex = typeof selectedIndex === 'object' &&
       Array.isArray(selectedIndex) &&
@@ -278,6 +287,7 @@ class ContextMenu extends React.Component {
       style={contextStyles}
     >
       <ContextMenuSingle contextMenuDetail={this.props.contextMenuDetail}
+        isTor={this.props.isTor}
         submenuIndex={0}
         lastZoomPercentage={this.props.lastZoomPercentage}
         template={this.props.template}
@@ -316,7 +326,12 @@ const styles = StyleSheet.create({
 
     // This is a reasonable max height and also solves problems for bookmarks menu
     // and bookmarks overflow menu reaching down too low.
-    maxHeight: `calc(100% - ${globalStyles.spacing.navbarHeight} + ${globalStyles.spacing.bookmarksToolbarWithFaviconsHeight})`,
+    // TODO (petemill): This is flakey since it does not cover dynamic 'navbar' height
+    // such as menu bar or notifications presence. It could be much more gracefully achieved
+    // via `bottom: 0` positioning and would look better by creating a container element
+    // which has `max-height: 100%` on it so that the inside of the menu box scrolled rather
+    // than the border scrolling away wierdly.
+    maxHeight: `calc(100% - ((2 * ${globalStyles.spacing.navbarMenubarMargin}) + ${globalStyles.spacing.navbarHeight} + ${globalStyles.spacing.bookmarksToolbarHeight}))`,
 
     '::-webkit-scrollbar': {
       backgroundColor: theme.contextMenu.scrollBar.backgroundColor

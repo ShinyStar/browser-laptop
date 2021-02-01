@@ -15,6 +15,7 @@ const punycode = require('punycode/')
 const urlParse = require('../../app/common/urlParse')
 const urlFormat = require('url').format
 const pdfjsExtensionId = require('../constants/config').PDFJSExtensionId
+const pdfjsBaseUrl = `chrome-extension://${pdfjsExtensionId}/`
 
 /**
  * A simple class for parsing and dealing with URLs.
@@ -334,7 +335,7 @@ const UrlUtil = {
    * @return {string}
    */
   getLocationIfPDF: function (url) {
-    if (!url || url.indexOf(`chrome-extension://${pdfjsExtensionId}/`) === -1) {
+    if (!UrlUtil.isUrlPDF(url)) {
       return url
     }
 
@@ -346,26 +347,24 @@ const UrlUtil = {
         return query.file
       }
     }
-    return url.replace(`chrome-extension://${pdfjsExtensionId}/`, '')
+    return UrlUtil.getUrlFromPDFUrl(url)
+  },
+
+  isUrlPDF: function (url) {
+    return (url && url.startsWith(pdfjsBaseUrl)) || false
+  },
+
+  getUrlFromPDFUrl: function (url) {
+    if (!UrlUtil.isUrlPDF(url)) {
+      return url
+    }
+
+    return url.replace(pdfjsBaseUrl, '')
   },
 
   getPDFViewerUrl: function (url) {
-    const pdfjsBaseUrl = `chrome-extension://${pdfjsExtensionId}/`
     const viewerBaseUrl = `${pdfjsBaseUrl}content/web/viewer.html`
     return `${viewerBaseUrl}?file=${encodeURIComponent(url)}`
-  },
-
-  /**
-   * Converts a potential PDF URL to the PDFJS URL.
-   * XXX: This only looks at the URL file extension, not MIME types.
-   * @param {string} url
-   * @return {string}
-   */
-  toPDFJSLocation: function (url) {
-    if (url && UrlUtil.isHttpOrHttps(url) && UrlUtil.isFileType(url, 'pdf')) {
-      return UrlUtil.getPDFViewerUrl(url)
-    }
-    return url
   },
 
   /**
@@ -387,7 +386,9 @@ const UrlUtil = {
       parsed.hostname = punycode.toASCII(parsed.hostname)
       return urlFormat(parsed)
     } catch (e) {
-      return punycode.toASCII(url)
+      var splitUrl = url.split('@')
+      splitUrl = splitUrl.map(str => punycode.toASCII(str))
+      return splitUrl.join('@')
     }
   },
 
@@ -415,7 +416,28 @@ const UrlUtil = {
    * @return {boolean}
    */
   isFileScheme: function (url) {
-    return this.getScheme(url) === fileScheme
+    if (!url) {
+      return false
+    }
+    return urlParse(url).protocol === 'file:'
+  },
+
+  /**
+   * Checks if URL is safe to open via 'open in new tab/window' context menu
+   * If so, returns the URL. If not, returns about:blank.
+   * @param {string} url - URL to check
+   * @return {string}
+   */
+  sanitizeForContextMenu: function (url) {
+    if (!url) {
+      return url
+    }
+    const protocol = urlParse(url).protocol
+    if (['http:', 'https:', 'ws:', 'wss:', 'magnet:', 'data:', 'blob:',
+      'about:', 'chrome-extension:', 'view-source:'].includes(protocol)) {
+      return url
+    }
+    return 'about:blank'
   },
 
   /**
@@ -433,7 +455,7 @@ const UrlUtil = {
     }
 
     const localFileOrigins = ['file:', 'blob:', 'data:', 'chrome-extension:', 'chrome:']
-    return origin && localFileOrigins.some((localFileOrigin) => origin.startsWith(localFileOrigin))
+    return localFileOrigins.some((localFileOrigin) => origin.startsWith(localFileOrigin))
   },
 
   getDisplayHost: (url) => {
@@ -484,6 +506,20 @@ const UrlUtil = {
     return url
       .replace(/((#?\/?)|(\/#?))$/, '') // remove trailing # and /
       .trim() // remove whitespaces
+  },
+
+  /**
+   * Whether a site is a Tor Hidden Service .onion URL
+   * @param {string} url
+   * @return {boolean}
+   */
+  isOnionUrl: (url) => {
+    if (typeof url !== 'string') { return false }
+    const hostname = urlParse(url).hostname
+    if (!hostname) {
+      return false
+    }
+    return hostname.endsWith('.onion')
   }
 }
 

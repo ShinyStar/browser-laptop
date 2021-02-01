@@ -45,6 +45,7 @@ const fakeElectron = {
     getPath: (param) => `${process.cwd()}/${param}`,
     getVersion: () => '0.14.0',
     setLocale: (locale) => {},
+    getCountryName: () => { return 'US' },
     quit: () => {},
     exit: () => {}
   }),
@@ -81,7 +82,17 @@ const fakeElectron = {
         }
       }
     },
-    fromPartition: () => {}
+    fromPartition: function (partition) {
+      if (!partition.startsWith('persist:') || partition === 'tor') {
+        return {
+          isOffTheRecord: function () { return true }
+        }
+      } else {
+        return {
+          isOffTheRecord: function () { return false }
+        }
+      }
+    }
   },
   extensions: {
     createTab: function () {}

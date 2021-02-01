@@ -19,6 +19,7 @@ module.exports = {
     zoomLevels: [-3.75, -3.35, -2.5, -1.65, -1.25, -0.5, -0.25, 0, 0.25, 0.5, 1.25, 2.5, 3.75, 5, 7.5, 10, 15, 20]
   },
   fingerprintingInfoUrl: 'https://github.com/brave/browser-laptop/wiki/Fingerprinting-Protection-Mode',
+  torCircuitInfoUrl: 'https://github.com/brave/browser-laptop/wiki/Using-Tor-in-Brave#what-does-the-new-tor-circuit-for-this-site-button-do',
   maxClosedFrames: 100,
   menu: {
     // History -> Recently closed frame list
@@ -40,6 +41,13 @@ module.exports = {
   navigationBar: {
     defaultSearchSuggestions: false,
     maxHistorySites: 10
+  },
+  // NOTE: values here correspond to `name` field in:
+  // js/data/searchProviders.js
+  defaultSearchEngineByCountry: {
+    'Germany': 'Qwant',
+    'France': 'Qwant',
+    'default': 'Google'
   },
   defaultOpenSearchPath: 'content/search/google.xml',
   vault: {

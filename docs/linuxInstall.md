@@ -40,12 +40,18 @@ Verify the `/etc/apt/sources.list.d/brave-*.list` file lists a new repository an
  grep lsb_release /etc/apt/sources.list.d/brave*
  ```
 
+
 Finally, install Brave:
 ```
 sudo apt update
 sudo apt install brave
 ```
 
+If you get this error when updating, you need an additional package.
+> E: Some files failed to download. They have been ignored, or old ones used instead.  
+ ```
+sudo apt-get install apt-transport-https
+ ```
 To install the latest `brave-beta` which often has early staging builds:
 
 ```
@@ -159,7 +165,7 @@ To install Brave using zypper:
 ```
 sudo rpmkeys --import https://s3-us-west-2.amazonaws.com/brave-rpm-release/keys.asc
 sudo zypper install lsb
-sudo zypper addrepo https://s3-us-west-2.amazonaws.com/brave-rpm-release/x86_64/ brave-rpm-release
+sudo zypper addrepo --type yast2 https://s3-us-west-2.amazonaws.com/brave-rpm-release/x86_64/ brave-rpm-release
 sudo zypper ref
 sudo zypper install brave
 ```
@@ -169,6 +175,14 @@ To update Brave using zypper:
 sudo zypper ref
 sudo zypper update brave
 ```
+
+If zypper throws an error similar to
+```
+Problem: nothing provides GConf2 needed by brave-*
+ Solution 1: do not install brave-*
+ Solution 2: break brave-* by ignoring some of its dependencies
+```
+Choose solution 2 and install gconf2 just to be safe. (`sudo zypper in gconf2`)
 
 Alternatively you can install the rpm directly, but then you won't get automatic upgrades:
 ```

@@ -9,31 +9,29 @@ const messages = require('../../js/constants/messages')
 const locale = require('../../js/l10n')
 const settings = require('../../js/constants/settings')
 const {tabs} = require('../../js/constants/config')
-const getSetting = require('../../js/settings').getSetting
+const {getSetting} = require('../../js/settings')
+const platformUtil = require('./lib/platformUtil')
 const communityURL = 'https://community.brave.com/'
-const isDarwin = process.platform === 'darwin'
 const electron = require('electron')
+const menuUtil = require('./lib/menuUtil')
 
-let BrowserWindow
-if (process.type === 'browser') {
-  BrowserWindow = electron.BrowserWindow
-} else {
-  BrowserWindow = electron.remote.BrowserWindow
-}
+const isDarwin = platformUtil.isDarwin()
+const isLinux = platformUtil.isLinux()
 
 const ensureAtLeastOneWindow = (frameOpts) => {
-  if (process.type === 'browser') {
-    if (BrowserWindow.getAllWindows().length === 0) {
-      appActions.newWindow(frameOpts || {})
-      return
-    }
-  }
-
-  if (!frameOpts) {
+  // Handle no new tab requested, but need a window
+  // and possibly there is no window.
+  if (!frameOpts && process.type === 'browser') {
+    // focus active window, or create a new one if there are none
+    appActions.focusOrCreateWindow()
     return
   }
-
-  appActions.createTabRequested(frameOpts)
+  // If this action is dispatched from a renderer window (Windows OS),
+  // it will create the tab in the current window since the action originates from it.
+  // If it was dispatched by the browser (macOS / Linux),
+  // then it will create the tab in the active window
+  // or a new window if there is no active window.
+  appActions.createTabRequested(frameOpts, false, false, true)
 }
 
 /**
@@ -80,11 +78,32 @@ module.exports.newTabMenuItem = (openerTabId) => {
 module.exports.newPrivateTabMenuItem = () => {
   return {
     label: locale.translation('newPrivateTab'),
-    accelerator: 'Shift+CmdOrCtrl+P',
+    accelerator: 'Shift+CmdOrCtrl+N',
     click: function (item, focusedWindow) {
       ensureAtLeastOneWindow({
         url: 'about:newtab',
         isPrivate: true
+      })
+    }
+  }
+}
+
+module.exports.newTorTabMenuItem = (isOSDrawn = true) => {
+  // On Windows and (often) Linux, a menu drawn by the OS
+  // via Muon will not display the 'Alt' modifier, so
+  // make sure we do not display a hint that is incorrect.
+  // On Windows we can leave it in sometimes since the main app menu is
+  // not OS-drawn, so we are ok to display the accelerator for it.
+  // On Linux, never display since it will be disabled in the OS-drawn App Menu.
+  const shouldShowAccelerator = !isLinux && (!isOSDrawn || isDarwin)
+  return {
+    label: locale.translation('newTorTab'),
+    accelerator: shouldShowAccelerator ? 'CmdOrCtrl+Alt+N' : undefined,
+    click: function (item, focusedWindow) {
+      ensureAtLeastOneWindow({
+        url: 'about:newtab',
+        isPrivate: true,
+        isTor: true
       })
     }
   }
@@ -142,7 +161,7 @@ module.exports.printMenuItem = () => {
 }
 
 module.exports.simpleShareActiveTabMenuItem = (l10nId, type, accelerator) => {
-  const siteName = type.charAt(0).toUpperCase() + type.slice(1)
+  const siteName = menuUtil.extractSiteName(type)
 
   return {
     label: locale.translation(l10nId, {siteName: siteName}),
@@ -159,20 +178,6 @@ module.exports.findOnPageMenuItem = () => {
     accelerator: 'CmdOrCtrl+F',
     click: function (item, focusedWindow) {
       module.exports.sendToFocusedWindow(focusedWindow, [messages.SHORTCUT_ACTIVE_FRAME_SHOW_FINDBAR])
-    }
-  }
-}
-
-module.exports.checkForUpdateMenuItem = () => {
-  return {
-    label: locale.translation('checkForUpdates'),
-    click: function (item, focusedWindow) {
-      if (process.type === 'browser') {
-        ensureAtLeastOneWindow()
-        process.emit(messages.CHECK_FOR_UPDATE)
-      } else {
-        electron.ipcRenderer.send(messages.CHECK_FOR_UPDATE)
-      }
     }
   }
 }
@@ -280,7 +285,7 @@ module.exports.submitFeedbackMenuItem = () => {
     click: function (item, focusedWindow) {
       ensureAtLeastOneWindow({
         url: communityURL
-      }, true)
+      })
     }
   }
 }

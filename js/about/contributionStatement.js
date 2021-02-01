@@ -8,10 +8,11 @@ const {makeImmutable} = require('../../app/common/state/immutableUtil')
 const {getBase64FromImageUrl} = require('../lib/imageUtil')
 
 const ledgerExportUtil = require('../../app/common/lib/ledgerExportUtil')
+const ledgerUtil = require('../../app/common/lib/ledgerUtil')
 const getTransactionCSVRows = ledgerExportUtil.getTransactionCSVRows
 const addExportFilenamePrefixToTransactions = ledgerExportUtil.addExportFilenamePrefixToTransactions
 
-const moment = require('moment')
+const format = require('date-fns/format')
 
 const messages = require('../constants/messages')
 
@@ -194,9 +195,9 @@ class ContributionStatement extends React.Component {
   }
 
   get contributionAmount () {
-    var fiatAmount = this.transaction.getIn(['contribution', 'fiat', 'amount'])
-    var currency = this.transaction.getIn(['contribution', 'fiat', 'currency']) || 'USD'
-    return (fiatAmount && typeof fiatAmount === 'number' ? fiatAmount.toFixed(2) : '0.00') + ' ' + currency
+    const fiatAmount = ledgerUtil.probiToFormat(this.transaction.getIn(['contribution', 'probi'])).toFixed(2)
+    const currency = this.transaction.getIn(['contribution', 'fiat', 'currency']) || 'USD'
+    return `${fiatAmount} ${currency}`
   }
 
   get ContributionStatementSummaryBox () {
@@ -326,11 +327,18 @@ class ContributionStatement extends React.Component {
               page.map(function (row, idx) {
                 const publisherKey = row[0]
                 const publisherSynopsis = (this.synopsis.filter((entry) => { return entry.publisherKey === publisherKey }) || [])[0] || {}
+                const name = this.state.transaction.getIn(['names', publisherKey])
 
                 const verified = publisherSynopsis && publisherSynopsis.verified
                 const fractionStr = (parseFloat(row[2]) * 100).toFixed(2)
                 const fiatStr = row[3]
-                const title = (publisherSynopsis && publisherSynopsis.siteName) ? publisherSynopsis.siteName : publisherKey
+                let title = publisherKey
+
+                if (publisherSynopsis && publisherSynopsis.siteName) {
+                  title = publisherSynopsis.siteName
+                } else if (name) {
+                  title = name
+                }
 
                 return (
                   <tr className={css(styles.textAlignRight, styles.table__tr)}>
@@ -463,19 +471,17 @@ class ContributionStatement extends React.Component {
 
 function formattedDateFromTimestamp (timestamp) {
   // e.g. 2016-11-15
-  return moment(new Date(timestamp)).format('YYYY-MM-DD')
+  return format(new Date(timestamp), 'YYYY-MM-DD')
 }
 
 function formattedTimeFromTimestamp (timestamp) {
   // e.g. 4:00pm
-  return moment(new Date(timestamp)).format('h:mma')
+  return format(new Date(timestamp), 'h:mma')
 }
 
 function longFormattedDateFromTimestamp (timestamp) {
-  let momentDate = moment(new Date(timestamp))
-
   // e.g. June 15th at 4:00pm
-  return `${momentDate.format('MMMM Do')} at ${momentDate.format('h:mma')}`
+  return `${format(new Date(timestamp), 'MMMM Do')} at ${format(new Date(timestamp), 'h:mma')}`
 }
 
 const containerMargin = '25px'

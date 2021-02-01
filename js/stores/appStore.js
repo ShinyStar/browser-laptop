@@ -23,7 +23,6 @@ const path = require('path')
 const diff = require('immutablediff')
 const debounce = require('../lib/debounce')
 const autofill = require('../../app/autofill')
-const nativeImage = require('../../app/nativeImage')
 const filtering = require('../../app/filtering')
 const basicAuth = require('../../app/browser/basicAuth')
 const webtorrent = require('../../app/browser/webtorrent')
@@ -35,9 +34,10 @@ const {HrtimeLogger} = require('../../app/common/lib/logUtil')
 const platformUtil = require('../../app/common/lib/platformUtil')
 const urlUtil = require('../lib/urlutil')
 const buildConfig = require('../constants/buildConfig')
+const {shouldDebugStoreActions} = require('../../app/cmdLine')
 
 // state helpers
-const {makeImmutable} = require('../../app/common/state/immutableUtil')
+const {makeImmutable, findNullKeyPaths} = require('../../app/common/state/immutableUtil')
 const basicAuthState = require('../../app/common/state/basicAuthState')
 const extensionState = require('../../app/common/state/extensionState')
 const aboutNewTabState = require('../../app/common/state/aboutNewTabState')
@@ -46,7 +46,6 @@ const tabState = require('../../app/common/state/tabState')
 const bookmarksState = require('../../app/common/state/bookmarksState')
 const bookmarkFoldersState = require('../../app/common/state/bookmarkFoldersState')
 const historyState = require('../../app/common/state/historyState')
-const bookmarkToolbarState = require('../../app/common/state/bookmarkToolbarState')
 
 // Only used internally
 const CHANGE_EVENT = 'app-state-change'
@@ -69,6 +68,14 @@ if (SHOULD_LOG_TIME) {
 }
 const timeLogger = new HrtimeLogger(TIME_LOG_PATH, TIME_LOG_THRESHOLD)
 
+function shouldIgnoreStateDiffForWindow (stateOp) {
+  const path = stateOp.get('path')
+  // remove tabs[].frame since it comes from the windowState anyway
+  // TODO: do we need to store this in the appState? It's expensive.
+  const shouldIgnore = (path.startsWith('/tabs/') && path.includes('/frame/'))
+  return shouldIgnore
+}
+
 class AppStore extends EventEmitter {
   constructor () {
     super()
@@ -81,15 +88,37 @@ class AppStore extends EventEmitter {
 
   emitChanges () {
     if (this.lastEmittedState && this.lastEmittedState !== appState) {
-      const d = diff(this.lastEmittedState, appState)
-      if (!d.isEmpty()) {
+      let d
+      try {
+        d = diff(this.lastEmittedState, appState)
+          // remove paths the window does not care about
+          .filterNot(shouldIgnoreStateDiffForWindow)
+      } catch (e) {
+        console.error('Error getting a diff from latest state.')
+        // one possible reason immutablediff can throw an error
+        // is due to null keys, so let's log any that we find
+        const nullKeyPaths = findNullKeyPaths(appState)
+        const error = (typeof e === 'object')
+          ? e
+          : (typeof e === 'string')
+            ? new Error(e)
+            : new Error()
+        for (let keyPath of nullKeyPaths) {
+          keyPath = keyPath.map(key => key === null ? 'null' : key)
+          const message = ` State path had null entry! Path was: [${keyPath.join(', ')}].`
+          error.message += message
+        }
+        throw error
+      }
+      if (d && !d.isEmpty()) {
+        const stateDiff = d.toJS()
         BrowserWindow.getAllWindows().forEach((wnd) => {
           if (wnd.webContents && !wnd.webContents.isDestroyed()) {
-            wnd.webContents.send(messages.APP_STATE_CHANGE, { stateDiff: d.toJS() })
+            wnd.webContents.send(messages.APP_STATE_CHANGE, { stateDiff })
           }
         })
         this.lastEmittedState = appState
-        this.emit(CHANGE_EVENT, d.toJS())
+        this.emit(CHANGE_EVENT, stateDiff)
       }
     } else {
       this.emit(CHANGE_EVENT, [])
@@ -158,12 +187,36 @@ function handleChangeSettingAction (state, settingKey, settingValue) {
         state = state.setIn(['settings', settingKey], homeArray.join('|'))
         break
       }
-    case settings.BOOKMARKS_TOOLBAR_MODE:
-      state = bookmarkToolbarState.setToolbars(state)
-      break
   }
 
   return state
+}
+
+const launchBraveCore = (state) => {
+  if (platformUtil.isLinux()) {
+    return
+  }
+
+  const installedPath = state.getIn(['about', 'init', 'braveCoreInstallPath'])
+  if (!installedPath) {
+    return
+  }
+
+  const childProcess = require('child_process')
+  const exec = childProcess.exec
+
+  try {
+    if (platformUtil.isDarwin()) {
+      exec(`open -a "${installedPath}"`)
+      console.log('opened brave-core instance (at "' + installedPath + '")')
+    } else if (platformUtil.isWindows()) {
+      exec(`"${installedPath}\\brave.exe"`)
+      console.log('opened brave-core instance (at "' + installedPath + '\\brave.exe")')
+    }
+  } catch (e) {
+    console.log('ERROR: tried to launch brave-core (at "' + installedPath +
+      '"), but an exception was thrown:\n' + e.toString())
+  }
 }
 
 let reducers = []
@@ -206,11 +259,12 @@ const handleAppAction = (action) => {
       require('../../app/browser/reducers/updatesReducer'),
       require('../../app/browser/reducers/aboutNewTabReducer'),
       require('../../app/browser/reducers/braverySettingsReducer'),
-      require('../../app/browser/reducers/bookmarkToolbarReducer'),
       require('../../app/browser/reducers/siteSettingsReducer'),
+      require('../../app/browser/reducers/torReducer'),
       require('../../app/browser/reducers/pageDataReducer'),
       ledgerReducer,
-      require('../../app/browser/menu')
+      require('../../app/browser/menu'),
+      require('../../app/browser/reducers/obsoletionReducer')
     ]
     initialized = true
     appState = action.appState
@@ -219,6 +273,10 @@ const handleAppAction = (action) => {
   if (!initialized) {
     console.error('Action called before state was initialized: ' + action.actionType)
     return
+  }
+
+  if (shouldDebugStoreActions) {
+    console.log('action:', action.actionType)
   }
 
   let immutableAction = Immutable.Map()
@@ -242,17 +300,22 @@ const handleAppAction = (action) => {
       // TODO(bridiver) - these should be refactored into reducers
       appState = filtering.init(appState, action, appStore)
       appState = basicAuth.init(appState, action, appStore)
-      appState = webtorrent.init(appState, action, appStore)
+      if (extensionState.isWebTorrentEnabled(appState)) {
+        appState = webtorrent.init(appState, action, appStore)
+      }
       appState = profiles.init(appState, action, appStore)
       appState = require('../../app/sync').init(appState, action, appStore)
       calculateTopSites(true, true)
       break
     case appConstants.APP_SHUTTING_DOWN:
-      appDispatcher.shutdown()
+      if (action.restart) {
+        const args = process.argv.slice(1)
+        args.push('--relaunch')
+        app.relaunch({args})
+      } else {
+        appDispatcher.shutdown()
+      }
       app.quit()
-      break
-    case appConstants.APP_DATA_URL_COPIED:
-      nativeImage.copyDataURL(action.dataURL, action.html, action.text)
       break
     case appConstants.APP_SET_DATA_FILE_ETAG:
       appState = appState.setIn([action.resourceName, 'etag'], action.etag)
@@ -313,41 +376,48 @@ const handleAppAction = (action) => {
         break
       }
     case appConstants.APP_SHOW_NOTIFICATION:
-      let notifications = appState.get('notifications')
-      notifications = notifications.filterNot((notification) => {
-        let message = notification.get('message')
-        // action.detail is a regular mutable object only when running tests
-        return action.detail.get
-          ? message === action.detail.get('message')
-          : message === action.detail['message']
-      })
-
-      // Insert notification next to those with the same style, or at the end
-      let insertIndex = notifications.size
-      const style = action.detail.get
-        ? action.detail.get('options').get('style')
-        : action.detail['options']['style']
-      if (style) {
-        const styleIndex = notifications.findLastIndex((notification) => {
-          return notification.get('options').get('style') === style
+      {
+        let notifications = appState.get('notifications', Immutable.List()) || Immutable.List()
+        notifications = notifications.filterNot((notification) => {
+          let message = notification.get('message')
+          // action.detail is a regular mutable object only when running tests
+          return action.detail.get
+            ? message === action.detail.get('message')
+            : message === action.detail['message']
         })
-        if (styleIndex > -1) {
-          insertIndex = styleIndex
-        } else {
-          // Insert after the last notification with a style
-          insertIndex = notifications.findLastIndex((notification) => {
-            return typeof notification.get('options').get('style') === 'string'
-          }) + 1
+
+        // Insert notification next to those with the same style, or at the end
+        let insertIndex = notifications.size
+        const style = action.detail
+          ? action.detail.get
+            ? action.detail.get('options').get('style')
+            : action.detail['options']['style']
+          : undefined
+        if (style) {
+          const styleIndex = notifications.findLastIndex((notification) => {
+            return notification.get('options').get('style') === style
+          })
+          if (styleIndex > -1) {
+            insertIndex = styleIndex
+          } else {
+            // Insert after the last notification with a style
+            insertIndex = notifications.findLastIndex((notification) => {
+              return typeof notification.get('options').get('style') === 'string'
+            }) + 1
+          }
         }
+        notifications = notifications.insert(insertIndex, Immutable.fromJS(action.detail))
+        appState = appState.set('notifications', notifications)
+        break
       }
-      notifications = notifications.insert(insertIndex, Immutable.fromJS(action.detail))
-      appState = appState.set('notifications', notifications)
-      break
     case appConstants.APP_HIDE_NOTIFICATION:
-      appState = appState.set('notifications', appState.get('notifications').filterNot((notification) => {
-        return notification.get('message') === action.message
-      }))
-      break
+      {
+        const notifications = appState.get('notifications', Immutable.List()) || Immutable.List()
+        appState = appState.set('notifications', notifications.filterNot((notification) => {
+          return notification.get('message') === action.message
+        }))
+        break
+      }
     case appConstants.APP_TAB_CLOSE_REQUESTED:
       const tabValue = tabState.getByTabId(appState, immutableAction.get('tabId'))
       if (!tabValue) {
@@ -359,7 +429,8 @@ const handleAppAction = (action) => {
         const tabsInOrigin = tabState.getTabs(appState).find((tabValue) =>
           urlUtil.getOrigin(tabValue.get('url')) === origin && tabValue.get('tabId') !== immutableAction.get('tabId'))
         if (!tabsInOrigin) {
-          appState = appState.set('notifications', appState.get('notifications').filterNot((notification) => {
+          const notifications = appState.get('notifications', Immutable.List()) || Immutable.List()
+          appState = appState.set('notifications', notifications.filterNot((notification) => {
             return notification.get('frameOrigin') === origin
           }))
         }
@@ -610,6 +681,9 @@ const handleAppAction = (action) => {
       break
     case appConstants.APP_SWIPE_RIGHT:
       appState = appState.set('swipeRightPercent', action.percent)
+      break
+    case appConstants.APP_LAUNCH_BRAVE_CORE:
+      launchBraveCore(appState)
       break
     default:
   }
